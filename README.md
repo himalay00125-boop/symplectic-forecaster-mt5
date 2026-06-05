@@ -214,6 +214,37 @@ python symplectic_forecaster.py --symbol US500 --timeframe H4 \
 | `--server` | *(none)* | MT5 server name (optional) |
 | `--mt5-path` | *(auto)* | Path to `terminal64.exe` (optional, auto-detected) |
 
+### Running with Docker
+
+Since MetaTrader 5 is a Windows application, running the forecaster inside a Docker container (which uses Linux) requires a lightweight **bridge** between the Linux container and your Windows host.
+
+#### Step 1: Start the MT5 bridge on your Windows host
+In a Command Prompt or PowerShell terminal on your Windows host, run:
+```cmd
+# Install RPyC bridge package
+pip install mt5linux rpyc
+
+# Start the bridge server (default port 18812)
+python -m mt5linux
+```
+*(Make sure your MetaTrader 5 terminal remains open and logged in on your Windows desktop).*
+
+#### Step 2: Build and run the Docker container
+Open a terminal in your project directory and run:
+```bash
+# Build the image and start the container
+docker compose up --build -d
+```
+
+#### Step 3: View the dashboard
+Once the container is running, access the dashboard at:
+[http://localhost:8080](http://localhost:8080)
+
+To stop the container, run:
+```bash
+docker compose down
+```
+
 ### Using as a Library
 
 ```python

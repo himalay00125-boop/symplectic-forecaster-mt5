@@ -96,8 +96,17 @@ except ImportError:
     from sklearn.linear_model import SGDRegressor
 
 try:
-    import MetaTrader5 as mt5
-    HAS_MT5 = True
+    import os
+    IS_DOCKER = os.path.exists('/.dockerenv') or os.environ.get('IS_DOCKER') == 'true'
+    if IS_DOCKER:
+        from mt5linux import MetaTrader5
+        host_ip = os.environ.get('MT5_HOST', 'host.docker.internal')
+        mt5 = MetaTrader5(host=host_ip)
+        HAS_MT5 = True
+        print(f"[INFO] Running in Docker. Bridging to MT5 host at {host_ip} via mt5linux.")
+    else:
+        import MetaTrader5 as mt5
+        HAS_MT5 = True
 except ImportError:
     HAS_MT5 = False
     print("[ERROR] MetaTrader5 package not found.")
