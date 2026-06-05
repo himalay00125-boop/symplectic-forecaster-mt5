@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Symplectic ML Forecaster Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root {
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --color-background-primary: #121214;
+  --color-background-secondary: #1a1a1e;
+  --color-border-tertiary: rgba(255, 255, 255, 0.08);
+  --color-border-secondary: rgba(255, 255, 255, 0.15);
+  --color-text-primary: #e6e4dd;
+  --color-text-secondary: #a6a49d;
+  --color-text-tertiary: #76746d;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-background-primary: #fbfbf9;
+    --color-background-secondary: #f3f3f0;
+    --color-border-tertiary: rgba(0, 0, 0, 0.06);
+    --color-border-secondary: rgba(0, 0, 0, 0.12);
+    --color-text-primary: #1e1c16;
+    --color-text-secondary: #5e5c56;
+    --color-text-tertiary: #8e8c86;
+  }
+}
+
+*{box-sizing:border-box;margin:0;padding:0;font-family:var(--font-mono,'JetBrains Mono',monospace)}
+body{background:var(--color-background-primary);color:var(--color-text-primary);padding:1.5rem}
+
+.dash{padding:0 0 1rem;max-width:1400px;margin:0 auto}
+/* header */
+.hdr{display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:10px;border-bottom:0.5px solid var(--color-border-tertiary);margin-bottom:12px}
+.hdr-left h1{font-size:14px;font-weight:600;letter-spacing:.1em;color:var(--color-text-primary)}
+.hdr-left p{font-size:10px;color:var(--color-text-tertiary);margin-top:3px;letter-spacing:.04em}
+.regime-badge{padding:4px 10px;border-radius:20px;font-size:10px;font-weight:600;letter-spacing:.08em}
+.regime-NORMAL{background:#e1f5ee;color:#0a5c43}
+.regime-ALERT{background:#faeeda;color:#7a4200}
+
+/* KPI strip */
+.kpi{display:grid;grid-template-columns:repeat(6,1fr);gap:7px;margin-bottom:12px}
+.kpi-card{background:var(--color-background-secondary);border-radius:8px;padding:9px 11px;border-left:2px solid transparent}
+.kpi-card.bull{border-color:#1d9e75}.kpi-card.bear{border-color:#d85a30}.kpi-card.neu{border-color:var(--color-border-secondary)}
+.kpi-lbl{font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--color-text-tertiary);margin-bottom:3px}
+.kpi-val{font-size:17px;font-weight:600;line-height:1}
+.kpi-val.bull{color:#1d9e75}.kpi-val.bear{color:#d85a30}.kpi-val.neu{color:var(--color-text-primary)}
+.kpi-sub{font-size:9px;color:var(--color-text-tertiary);margin-top:3px}
+
+/* layout grid */
+.grid-main{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+.card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:10px;padding:12px}
+.card.full{grid-column:1/-1}
+.card-title{font-size:10px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--color-text-secondary);margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.badge{font-size:8px;padding:1px 5px;border-radius:3px;letter-spacing:.05em;font-weight:500}
+.b-sym{background:#daf2ea;color:#0a5c43}.b-tda{background:#ddeaf8;color:#1445a0}.b-ml{background:#faeeda;color:#7a4200}
+.eq{font-size:9px;color:var(--color-text-tertiary);background:var(--color-background-secondary);border-left:2px solid #1d9e75;padding:5px 8px;border-radius:4px;margin-bottom:8px;line-height:1.5}
+
+/* canvas sizing */
+#phaseWrap{position:relative;width:100%;height:180px}
+#priceWrap{position:relative;width:100%;height:220px}
+#bettiWrap{position:relative;width:100%;height:180px}
+#accWrap{position:relative;width:100%;height:180px}
+
+/* scenario panel */
+.sc-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:6px}
+.sc-card{border-radius:6px;padding:8px 10px;text-align:center}
+.sc-card.bull{background:#e1f5ee}.sc-card.bear{background:#faece7}.sc-card.base{background:var(--color-background-secondary)}
+.sc-label{font-size:9px;letter-spacing:.06em;text-transform:uppercase;font-weight:600}
+.sc-card.bull .sc-label{color:#0a5c43}.sc-card.bear .sc-label{color:#993c1d}.sc-card.base .sc-label{color:var(--color-text-secondary)}
+.sc-price{font-size:18px;font-weight:700;margin:4px 0 2px;font-family:var(--font-mono)}
+.sc-card.bull .sc-price{color:#1d9e75}.sc-card.bear .sc-price{color:#d85a30}.sc-card.base .sc-price{color:var(--color-text-primary)}
+.sc-path{font-size:8.5px;color:var(--color-text-tertiary);line-height:1.6}
+
+.band-info{margin-top:8px;font-size:9px;color:var(--color-text-tertiary);padding:6px 8px;background:var(--color-background-secondary);border-radius:5px;line-height:1.6}
+
+/* math panel */
+.math-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.math-box{padding:8px 10px;background:var(--color-background-secondary);border-radius:6px}
+.math-box h4{font-size:9px;letter-spacing:.07em;text-transform:uppercase;color:var(--color-text-secondary);margin-bottom:5px;font-weight:600}
+.math-box p{font-size:9.5px;color:var(--color-text-tertiary);line-height:1.65}
+.math-box code{font-size:9px;background:rgba(29,158,117,.12);color:#1d9e75;padding:1px 4px;border-radius:3px}
+
+/* system stats footer */
+.footer{margin-top:15px;text-align:center;font-size:9.5px;color:var(--color-text-tertiary)}
+</style>
+</head>
+<body>
+<div class="dash">
+
+<!-- HEADER -->
+<div class="hdr">
+  <div class="hdr-left">
+    <h1 id="dash-title">SYMPLECTIC ML FORECASTER · --</h1>
+    <p id="dash-subtitle">Self-learning · Persistent homology · Phase-space geometry · MT5 Live Data Stream</p>
+  </div>
+  <div class="regime-badge regime-NORMAL" id="regime-badge">● NORMAL REGIME</div>
+</div>
+
+<!-- KPI STRIP -->
+<div class="kpi">
+  <div class="kpi-card neu">
+    <div class="kpi-lbl">Last close</div>
+    <div class="kpi-val neu" id="kpi-close">--</div>
+    <div class="kpi-sub" id="kpi-date">--</div>
+  </div>
+  <div class="kpi-card neu" id="kpi-fc-card">
+    <div class="kpi-lbl">Forecast Δ</div>
+    <div class="kpi-val neu" id="kpi-fc-val">--</div>
+    <div class="kpi-sub" id="kpi-fc-sub">--</div>
+  </div>
+  <div class="kpi-card neu">
+    <div class="kpi-lbl">ECH capacity C(t)</div>
+    <div class="kpi-val neu" id="kpi-capacity">--</div>
+    <div class="kpi-sub">symplectic area</div>
+  </div>
+  <div class="kpi-card neu">
+    <div class="kpi-lbl">Betti-1 β₁</div>
+    <div class="kpi-val neu" id="kpi-betti">--</div>
+    <div class="kpi-sub">H₁ loop count</div>
+  </div>
+  <div class="kpi-card neu">
+    <div class="kpi-lbl">Ensemble MAE</div>
+    <div class="kpi-val neu" id="kpi-mae">--</div>
+    <div class="kpi-sub">model accuracy</div>
+  </div>
+  <div class="kpi-card neu">
+    <div class="kpi-lbl">Model updates</div>
+    <div class="kpi-val neu" id="kpi-updates">--</div>
+    <div class="kpi-sub">online trained</div>
+  </div>
+</div>
+
+<!-- ROW 1: price chart full width -->
+<div class="grid-main">
+  <div class="card full">
+    <div class="card-title">
+      Price Action + Symplectic Capacity C(t) + Forecast Signal
+      <span class="badge b-sym">ECH capacity</span>
+      <span class="badge b-ml">PA+HT ensemble</span>
+    </div>
+    <div class="eq">q(t) = ln P(t) · p(t) = V(t)·sign(ΔP) · C(t) = Area(Conv(D_t))  [Mishra 2026, Def 2.1 + Cor 2.10]</div>
+    <div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">
+      <span style="font-size:9px;color:var(--color-text-secondary);display:flex;align-items:center;gap:5px"><span style="width:18px;height:2px;background:#378add;display:inline-block;border-radius:1px"></span>price $</span>
+      <span style="font-size:9px;color:var(--color-text-secondary);display:flex;align-items:center;gap:5px"><span style="width:18px;height:2px;background:#1d9e75;display:inline-block;border-radius:1px;border-top:2px dashed #1d9e75"></span>C(t)</span>
+      <span style="font-size:9px;color:var(--color-text-secondary);display:flex;align-items:center;gap:5px"><span style="width:18px;height:2px;background:#ba7517;display:inline-block;border-radius:1px"></span>forecast direction</span>
+      <span style="font-size:9px;color:var(--color-text-secondary);display:flex;align-items:center;gap:5px"><span style="width:8px;height:8px;background:#d85a30;display:inline-block;border-radius:50%"></span>alert</span>
+    </div>
+    <div id="priceWrap"><canvas id="priceChart"></canvas></div>
+  </div>
+
+  <!-- Phase space -->
+  <div class="card">
+    <div class="card-title">Symplectic Phase Space Ω_t <span class="badge b-sym">dq∧dp</span></div>
+    <div class="eq">(M,ω) · ω=dq∧dp · Hull = teal · iso = 4πC/L² ∈ (0,1]</div>
+    <div id="phaseWrap"><canvas id="phaseChart"></canvas></div>
+  </div>
+
+  <!-- Betti-1 -->
+  <div class="card">
+    <div class="card-title">β₁ Betti-1 &amp; Total Persistence <span class="badge b-tda">H₁ Rips</span></div>
+    <div class="eq">β₁ = persistent H₁ generators — loop count ↑ = market cycle detected</div>
+    <div id="bettiWrap"><canvas id="bettiChart"></canvas></div>
+  </div>
+
+  <!-- 5-bar scenarios -->
+  <div class="card">
+    <div class="card-title">5-Bar Forecast Scenarios <span class="badge b-sym">Lemma 3.1</span></div>
+    <div class="eq">Stability band: |C(t)−C(t')| ≤ L·δ + π·δ² · band = shape_k·σ√h·3</div>
+    <div class="sc-grid">
+      <div class="sc-card bull">
+        <div class="sc-label">Bull</div>
+        <div class="sc-price" id="bull-p5">--</div>
+        <div class="sc-path" id="bull-path">--</div>
+      </div>
+      <div class="sc-card base">
+        <div class="sc-label">Base</div>
+        <div class="sc-price" id="base-p5">--</div>
+        <div class="sc-path" id="base-path">--</div>
+      </div>
+      <div class="sc-card bear">
+        <div class="sc-label">Bear</div>
+        <div class="sc-price" id="bear-p5">--</div>
+        <div class="sc-path" id="bear-path">--</div>
+      </div>
+    </div>
+    <div class="band-info" id="band-text">
+      <b>Symplectic stability band:</b> --
+    </div>
+  </div>
+
+  <!-- Rolling accuracy -->
+  <div class="card">
+    <div class="card-title">Rolling 30-Bar Direction Accuracy <span class="badge b-ml">walk-forward</span></div>
+    <div id="accWrap"><canvas id="accChart"></canvas></div>
+  </div>
+
+  <!-- Math reference -->
+  <div class="card">
+    <div class="card-title">Mathematical Basis</div>
+    <div class="math-grid">
+      <div class="math-box">
+        <h4>Symplectic Phase Space</h4>
+        <p><code>(M,ω)</code> where <code>ω = dq∧dp</code><br>
+        <code>q = ln P(t)</code> log-price<br>
+        <code>p = V·sign(ΔP)</code> signed vol<br>
+        <code>C(t) = Area(Conv D_t)</code><br>
+        <i>Mishra 2026, Def 2.1</i></p>
+      </div>
+      <div class="math-box">
+        <h4>Stability Lemma 3.1</h4>
+        <p><code>|C−C'| ≤ L·δ + π·δ²</code><br>
+        δ = Hausdorff perturbation<br>
+        L = hull perimeter<br>
+        iso = 4πC/L² ∈ (0,1]<br>
+        <i>Mishra 2026, Lemma 3.1</i></p>
+      </div>
+      <div class="math-box">
+        <h4>TDA Features</h4>
+        <p>Vietoris-Rips filtration<br>
+        <code>β₀</code> components, <code>β₁</code> loops<br>
+        max persistence H₀, H₁<br>
+        total persistence Σ<br>
+        <i>Shultz 2023, §2.3</i></p>
+      </div>
+      <div class="math-box">
+        <h4>Online Ensemble</h4>
+        <p>PA-Regressor: fast adapt<br>
+        Hoeffding Tree: structure<br>
+        weights ∝ 1/MAE_recent<br>
+        <i>River online ML</i></p>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- FOOTER / STATS -->
+<div class="footer" id="footer-text">
+  MT5 Account: -- · Balance: -- · Leverage: -- · Broker: --
+</div>
+
+</div>
+
+<script>
+// ── CONSTANTS ─────────────────────────────────────────────────────────────
+const isDark = window.matchMedia('(prefers-color-scheme:dark)').matches;
+const C = {
+  text:   isDark ? 'rgba(230,228,221,0.65)' : 'rgba(30,28,22,0.6)',
+  grid:   isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.055)',
+  blue:   '#378add', teal: '#1d9e75', amber: '#ba7517',
+  coral:  '#d85a30', hullfill: 'rgba(29,158,117,0.1)',
+  hullborder: '#1d9e75',
+  ptcol:  isDark ? 'rgba(196,194,184,0.45)' : 'rgba(100,98,92,0.38)',
+};
+
+const baseScale = {
+  x: { grid:{color:C.grid}, ticks:{color:C.text,font:{size:9},maxTicksLimit:8} },
+  y: { grid:{color:C.grid}, ticks:{color:C.text,font:{size:9}} }
+};
+const baseOpts = {
+  responsive:true, maintainAspectRatio:false,
+  animation:{duration:200},
+  plugins:{ legend:{display:false},
+    tooltip:{mode:'index',intersect:false,
+      backgroundColor: isDark?'rgba(10,10,12,0.92)':'rgba(255,255,255,0.96)',
+      titleColor:C.text,bodyColor:C.text,borderColor:C.grid,borderWidth:1}}
+};
+
+let priceChart = null;
+let phaseChart = null;
+let bettiChart = null;
+let accChart = null;
+
+// ── POLL DATA ─────────────────────────────────────────────────────────────
+function updateDashboard() {
+  fetch('/data')
+    .then(res => {
+      if (!res.ok) throw new Error("Server error");
+      return res.json();
+    })
+    .then(data => {
+      // 1. Update Title and Headers
+      document.getElementById('dash-title').innerText = `SYMPLECTIC ML FORECASTER · ${data.meta.symbol} (${data.meta.timeframe})`;
+      document.getElementById('dash-subtitle').innerText = `Self-learning · Persistent homology · Phase-space geometry · ${data.kpis.updates} online updates`;
+      
+      const regimeBadge = document.getElementById('regime-badge');
+      regimeBadge.innerText = `● ${data.kpis.regime} REGIME`;
+      regimeBadge.className = `regime-badge regime-${data.kpis.regime}`;
+      
+      // 2. Update KPIs
+      document.getElementById('kpi-close').innerText = data.kpis.last_close;
+      document.getElementById('kpi-date').innerText = data.kpis.date;
+      
+      const fcVal = document.getElementById('kpi-fc-val');
+      const fcSub = document.getElementById('kpi-fc-sub');
+      const fcCard = document.getElementById('kpi-fc-card');
+      fcVal.innerText = data.kpis.forecast_pct;
+      fcSub.innerText = data.kpis.forecast_sub;
+      
+      // color KPI strip depending on buy/sell/hold
+      fcCard.className = 'kpi-card';
+      fcVal.className = 'kpi-val';
+      if (data.kpis.forecast_sub.includes('bullish')) {
+        fcCard.classList.add('bull');
+        fcVal.classList.add('bull');
+      } else if (data.kpis.forecast_sub.includes('bearish')) {
+        fcCard.classList.add('bear');
+        fcVal.classList.add('bear');
+      } else {
+        fcCard.classList.add('neu');
+        fcVal.classList.add('neu');
+      }
+
+      document.getElementById('kpi-capacity').innerText = data.kpis.capacity;
+      document.getElementById('kpi-betti').innerText = data.kpis.betti_1;
+      document.getElementById('kpi-mae').innerText = data.kpis.mae;
+      document.getElementById('kpi-updates').innerText = data.kpis.updates;
+
+      // 3. Update Scenarios
+      document.getElementById('bull-p5').innerText = data.scenarios.bull_p5 || '--';
+      document.getElementById('base-p5').innerText = data.scenarios.base_p5 || '--';
+      document.getElementById('bear-p5').innerText = data.scenarios.bear_p5 || '--';
+      
+      document.getElementById('bull-path').innerHTML = data.scenarios.bull_path_str || '--';
+      document.getElementById('base-path').innerHTML = data.scenarios.base_path_str || '--';
+      document.getElementById('bear-path').innerHTML = data.scenarios.bear_path_str || '--';
+      
+      document.getElementById('band-text').innerHTML = `<b>Symplectic stability band (t+1):</b> ${data.scenarios.upper_band[0] || '--'} – ${data.scenarios.lower_band[0] || '--'}<br>
+      From Lemma 3.1: Lipschitz cone width = shape_k·σ·√h·3 · exp(±band_half)<br>
+      shape_k = 1 + (1 − iso) where iso = 4πC(t)/L(t)² <i>(isoperimetric ratio)</i>`;
+
+      // 4. Update Footer info
+      if (data.meta.account) {
+        document.getElementById('footer-text').innerText = `MT5 Account: ${data.meta.account} (${data.meta.trade_mode}) · Balance: ${data.meta.balance} ${data.meta.currency} · Leverage: 1:${data.meta.leverage} · Server: ${data.meta.server}`;
+      }
+
+      // 5. Render/Update Charts
+      renderCharts(data);
+    })
+    .catch(err => {
+      console.error("Dashboard poll failed:", err);
+    });
+}
+
+function renderCharts(data) {
+  const chartData = data.CHART || [];
+  const hitsData = data.HITS || [];
+  const phaseData = data.PHASE || [];
+  const hullData = data.HULL || [];
+  
+  const labels = chartData.map(d => d.d);
+  const priceData = chartData.map(d => d.c);
+  const capData = chartData.map(d => d.cap);
+  const fcData = chartData.map(d => d.fc);
+  const alertPts = chartData.map(d => d.al ? d.c : null);
+
+  // --- Price & Capacity Chart ---
+  if (!priceChart) {
+    priceChart = new Chart(document.getElementById('priceChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'price $', data: priceData, borderColor: C.blue, borderWidth: 1.8, pointRadius: 0, yAxisID: 'yP', tension: 0.15 },
+          { label: 'C(t)', data: capData, borderColor: C.teal, borderWidth: 1.2, borderDash: [4,3], pointRadius: 0, yAxisID: 'yC', tension: 0.2 },
+          { label: 'forecast return', data: fcData, borderColor: C.amber, borderWidth: 1, pointRadius: 0, yAxisID: 'yF', tension: 0.1 },
+          { label: 'alert', data: alertPts, borderColor: 'transparent', backgroundColor: C.coral, pointRadius: chartData.map(d => d.al ? 4 : 0), pointBackgroundColor: C.coral, showLine: false, yAxisID: 'yP' }
+        ]
+      },
+      options: {
+        ...baseOpts,
+        scales: {
+          x: baseScale.x,
+          yP: { position: 'left', grid: { color: C.grid }, ticks: { color: C.blue, font: { size: 9 } }, title: { display: true, text: 'price $', color: C.blue, font: { size: 9 } } },
+          yC: { position: 'right', grid: { drawOnChartArea: false }, ticks: { color: C.teal, font: { size: 9 } }, title: { display: true, text: 'C(t)', color: C.teal, font: { size: 9 } } },
+          yF: { display: false }
+        }
+      }
+    });
+  } else {
+    priceChart.data.labels = labels;
+    priceChart.data.datasets[0].data = priceData;
+    priceChart.data.datasets[1].data = capData;
+    priceChart.data.datasets[2].data = fcData;
+    priceChart.data.datasets[3].data = alertPts;
+    priceChart.data.datasets[3].pointRadius = chartData.map(d => d.al ? 4 : 0);
+    priceChart.update('none');
+  }
+
+  // --- Phase Space Scatter Chart ---
+  if (!phaseChart) {
+    phaseChart = new Chart(document.getElementById('phaseChart'), {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: '(q,p)', data: phaseData.map(p => ({x: p.q, y: p.p})), backgroundColor: C.ptcol, pointRadius: 3, pointHoverRadius: 4.5 },
+          { label: 'Conv(Dₜ)', data: hullData.map(p => ({x: p.q, y: p.p})), borderColor: C.hullborder, backgroundColor: C.hullfill, showLine: true, fill: true, borderWidth: 1.8, pointRadius: 4, pointBackgroundColor: C.teal, tension: 0 }
+        ]
+      },
+      options: {
+        ...baseOpts,
+        plugins: {
+          ...baseOpts.plugins,
+          tooltip: {
+            ...baseOpts.plugins.tooltip,
+            callbacks: { label: c => `(${c.parsed.x.toFixed(4)}, ${c.parsed.y.toFixed(2)})` }
+          }
+        },
+        scales: {
+          x: { ...baseScale.x, title: { display: true, text: 'q = ln P(t)', color: C.text, font: { size: 9 } } },
+          y: { ...baseScale.y, title: { display: true, text: 'p = V·sign(ΔP)', color: C.text, font: { size: 9 } } }
+        }
+      }
+    });
+  } else {
+    phaseChart.data.datasets[0].data = phaseData.map(p => ({x: p.q, y: p.p}));
+    phaseChart.data.datasets[1].data = hullData.map(p => ({x: p.q, y: p.p}));
+    phaseChart.update('none');
+  }
+
+  // --- Betti Numbers Chart ---
+  const bettiData = chartData.map(d => d.b1);
+  const tpData = chartData.map(d => d.tp);
+  if (!bettiChart) {
+    bettiChart = new Chart(document.getElementById('bettiChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'β₁', data: bettiData, borderColor: '#5dcaa5', backgroundColor: 'rgba(93,202,165,0.1)', fill: true, borderWidth: 2, pointRadius: 0, stepped: true, yAxisID: 'yB' },
+          { label: 'tot_pers', data: tpData, borderColor: C.amber, borderWidth: 1, borderDash: [3,3], pointRadius: 0, tension: 0.2, yAxisID: 'yT' }
+        ]
+      },
+      options: {
+        ...baseOpts,
+        scales: {
+          x: baseScale.x,
+          yB: { position: 'left', grid: { color: C.grid }, ticks: { color: '#5dcaa5', font: { size: 9 } }, title: { display: true, text: 'β₁', color: '#5dcaa5', font: { size: 9 } }, min: 0 },
+          yT: { position: 'right', grid: { drawOnChartArea: false }, ticks: { color: C.amber, font: { size: 9 } }, title: { display: true, text: 'tot pers', color: C.amber, font: { size: 9 } } }
+        }
+      }
+    });
+  } else {
+    bettiChart.data.labels = labels;
+    bettiChart.data.datasets[0].data = bettiData;
+    bettiChart.data.datasets[1].data = tpData;
+    bettiChart.update('none');
+  }
+
+  // --- Accuracy Chart ---
+  if (!accChart) {
+    accChart = new Chart(document.getElementById('accChart'), {
+      type: 'bar',
+      data: {
+        labels: hitsData.map(h => h.d),
+        datasets: [{
+          label: '30-bar accuracy %',
+          data: hitsData.map(h => h.a),
+          backgroundColor: hitsData.map(h => h.a >= 50 ? 'rgba(29,158,117,0.72)' : 'rgba(216,90,48,0.55)'),
+          borderRadius: 3
+        }]
+      },
+      options: {
+        ...baseOpts,
+        scales: {
+          x: baseScale.x,
+          y: { ...baseScale.y, min: 30, max: 70, ticks: { ...baseScale.y.ticks, callback: v => v + '%' } }
+        }
+      }
+    });
+  } else {
+    accChart.data.labels = hitsData.map(h => h.d);
+    accChart.data.datasets[0].data = hitsData.map(h => h.a);
+    accChart.data.datasets[0].backgroundColor = hitsData.map(h => h.a >= 50 ? 'rgba(29,158,117,0.72)' : 'rgba(216,90,48,0.55)');
+    accChart.update('none');
+  }
+}
+
+// Start polling
+updateDashboard();
+setInterval(updateDashboard, 2000);
+</script>
+</body>
+</html>

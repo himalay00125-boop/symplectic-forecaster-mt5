@@ -74,6 +74,9 @@ from scipy.spatial import ConvexHull
 
 warnings.filterwarnings("ignore")
 
+# Thread-safe global reference to dashboard state
+global_dashboard_state = None
+
 # ---------------------------------------------------------------------------
 # Optional heavy dependencies — graceful fallback if unavailable
 # ---------------------------------------------------------------------------
@@ -438,14 +441,14 @@ class TradingEngine:
         RESET  = "\033[0m"
 
         color = {"BUY": GREEN, "SELL": RED, "HOLD": YELLOW}.get(signal.action, RESET)
-        arrow = {"BUY": "▲ BUY ", "SELL": "▼ SELL", "HOLD": "━ HOLD"}.get(signal.action, "?")
+        arrow = {"BUY": " BUY ", "SELL": " SELL", "HOLD": " HOLD"}.get(signal.action, "?")
 
-        print(f"\n{BOLD}{'─' * 66}{RESET}")
-        print(f"  {CYAN}⏱  {signal.timestamp}{RESET}  │  {BOLD}{signal.symbol}{RESET}")
-        print(f"  {color}{BOLD}{arrow}{RESET}  │  "
-              f"Price: {signal.current_price:.5f}  │  "
+        print(f"\n{BOLD}{'-' * 66}{RESET}")
+        print(f"  {CYAN}[TIME] {signal.timestamp}{RESET}  |  {BOLD}{signal.symbol}{RESET}")
+        print(f"  {color}{BOLD}{arrow}{RESET}  |  "
+              f"Price: {signal.current_price:.5f}  |  "
               f"Confidence: {signal.confidence:.1%}")
-        print(f"  Predicted Return: {signal.predicted_return:+.4%}  │  "
+        print(f"  Predicted Return: {signal.predicted_return:+.4%}  |  "
               f"Regime: {signal.regime}")
         print(f"  {DIM}{signal.reason}{RESET}")
 
@@ -453,10 +456,10 @@ class TradingEngine:
             print(f"\n  {CYAN}Scenarios ({signal.forecast_horizon}-bar ahead):{RESET}")
             for name, path in signal.scenarios.items():
                 sc_color = {"bull": GREEN, "bear": RED, "base": YELLOW}.get(name, RESET)
-                prices_str = " → ".join(f"{p:.5f}" for p in path)
+                prices_str = " -> ".join(f"{p:.5f}" for p in path)
                 print(f"    {sc_color}{name:4s}{RESET}: {prices_str}")
 
-        print(f"{BOLD}{'─' * 66}{RESET}")
+        print(f"{BOLD}{'-' * 66}{RESET}")
 
     def on_signal(self, forecast: Dict, symbol: str):
         """
@@ -473,6 +476,239 @@ class TradingEngine:
             "sells": self._signal_count["SELL"],
             "holds": self._signal_count["HOLD"],
         }
+
+
+# ===========================================================================
+# DASHBOARD STATE & HTTP SERVER
+# ===========================================================================
+
+import threading
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class DashboardState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.symbol = "--"
+        self.timeframe = "--"
+        self.chart_records = []  # max length 200
+        self.phase_points = []
+        self.hull_points = []
+        self.account_info = {}
+        self.scenarios = {}
+        self.updates_count = 0
+        self.hits_records = []  # rolling 30-bar accuracy points
+        self.latest_kpi = {
+            "last_close": "--", "date": "--", "forecast_pct": "--", "forecast_sub": "--",
+            "capacity": "--", "betti_1": "--", "mae": "--", "updates": "0", "regime": "NORMAL"
+        }
+
+    def update_live_metrics(self, symbol: str, timeframe: str, latest_forecast: dict, phase_buf: list, hull_points: list, acc_info: dict, total_updates: int):
+        with self.lock:
+            self.symbol = symbol
+            self.timeframe = timeframe
+            self.account_info = acc_info
+            self.updates_count = total_updates
+            
+            # Extract scenarios
+            if "scenarios" in latest_forecast and latest_forecast["scenarios"]:
+                self.scenarios = {
+                    "bull_p5": f"${latest_forecast['scenarios']['bull'][-1]:.5f}",
+                    "base_p5": f"${latest_forecast['scenarios']['base'][-1]:.5f}",
+                    "bear_p5": f"${latest_forecast['scenarios']['bear'][-1]:.5f}",
+                    "bull_path_str": " → ".join(f"{p:.5f}" for p in latest_forecast['scenarios']['bull']),
+                    "base_path_str": " → ".join(f"{p:.5f}" for p in latest_forecast['scenarios']['base']),
+                    "bear_path_str": " → ".join(f"{p:.5f}" for p in latest_forecast['scenarios']['bear']),
+                    "upper_band": latest_forecast.get("upper_band", []),
+                    "lower_band": latest_forecast.get("lower_band", []),
+                }
+            else:
+                self.scenarios = {
+                    "bull_p5": "--", "base_p5": "--", "bear_p5": "--",
+                    "bull_path_str": "--", "base_path_str": "--", "bear_path_str": "--",
+                    "upper_band": [], "lower_band": []
+                }
+            
+            # Format date/timestamp
+            ts = latest_forecast.get("timestamp", time.time())
+            if isinstance(ts, (int, float)):
+                dt_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+            else:
+                dt_str = str(ts)
+            
+            # Format forecast string
+            direction = latest_forecast.get("direction", 0)
+            confidence = latest_forecast.get("confidence", 0.0)
+            pred_ret = latest_forecast.get("predicted_return", latest_forecast.get("forecast", 0.0))
+            
+            forecast_pct = f"{pred_ret:+.4%}"
+            if direction > 0:
+                forecast_sub = f"↑ bullish signal ({confidence:.1%} conf)"
+            elif direction < 0:
+                forecast_sub = f"↓ bearish signal ({confidence:.1%} conf)"
+            else:
+                forecast_sub = f"→ hold/neutral signal"
+            
+            mae_val = latest_forecast.get("mae_ht") or latest_forecast.get("mae_pa") or 0.001
+            self.latest_kpi = {
+                "last_close": f"{latest_forecast.get('close', 0.0):.5f}",
+                "date": dt_str,
+                "forecast_pct": forecast_pct,
+                "forecast_sub": forecast_sub,
+                "capacity": f"{latest_forecast.get('capacity', 0.0):.6f}",
+                "betti_1": str(latest_forecast.get('betti_1', 0)),
+                "mae": f"{mae_val:.6f}",
+                "updates": str(total_updates),
+                "regime": "ALERT" if latest_forecast.get("alert", False) else "NORMAL"
+            }
+            
+            # Update phase and hull points
+            self.phase_points = [{"q": float(p[0]), "p": float(p[1])} for p in phase_buf]
+            self.hull_points = [{"q": float(p[0]), "p": float(p[1])} for p in hull_points]
+            
+            # Append new record to chart history
+            new_chart_rec = {
+                "d": dt_str.split(" ")[-1] if " " in dt_str else dt_str,
+                "c": float(latest_forecast.get("close", 0.0)),
+                "cap": float(latest_forecast.get("capacity", 0.0)),
+                "b1": int(latest_forecast.get("betti_1", 0)),
+                "fc": float(latest_forecast.get("forecast", 0.0)),
+                "ret": float(latest_forecast.get("log_return", 0.0)),
+                "al": 1 if latest_forecast.get("alert", False) else 0,
+                "tp": float(latest_forecast.get("tot_pers", 0.0))
+            }
+            
+            if not self.chart_records or self.chart_records[-1]["d"] != new_chart_rec["d"]:
+                self.chart_records.append(new_chart_rec)
+                if len(self.chart_records) > 200:
+                    self.chart_records.pop(0)
+            
+            self._recalculate_accuracy()
+
+    def load_historical_dataframe(self, df: pd.DataFrame):
+        with self.lock:
+            self.chart_records = []
+            for i, row in df.iterrows():
+                dt_str = row.get("date", str(row.get("timestamp", "")))
+                short_date = dt_str.split(" ")[-1] if " " in dt_str else dt_str
+                self.chart_records.append({
+                    "d": short_date,
+                    "c": float(row.get("close", 0.0)),
+                    "cap": float(row.get("capacity", 0.0)),
+                    "b1": int(row.get("betti_1", 0)),
+                    "fc": float(row.get("forecast", 0.0)),
+                    "ret": float(row.get("log_return", 0.0)),
+                    "al": 1 if row.get("alert", False) else 0,
+                    "tp": float(row.get("tot_pers", 0.0))
+                })
+            
+            if len(self.chart_records) > 200:
+                self.chart_records = self.chart_records[-200:]
+                
+            self._recalculate_accuracy()
+
+    def _recalculate_accuracy(self):
+        self.hits_records = []
+        n_records = len(self.chart_records)
+        if n_records < 31:
+            # Fake flat accuracy data during initial warmup/training transition
+            if n_records > 1:
+                self.hits_records = [{"d": r["d"], "a": 50.0} for r in self.chart_records[1::10]]
+            return
+            
+        step = max(1, (n_records - 30) // 12)
+        for end_idx in range(30, n_records, step):
+            window_recs = self.chart_records[end_idx - 30 : end_idx]
+            correct = 0
+            total = 0
+            for j in range(len(window_recs) - 1):
+                pred_direction = window_recs[j]["fc"]
+                actual_return = window_recs[j+1]["ret"]
+                
+                if abs(pred_direction) > 1e-8:
+                    total += 1
+                    if (pred_direction > 0 and actual_return > 0) or (pred_direction < 0 and actual_return < 0):
+                        correct += 1
+            
+            acc = (correct / total * 100) if total > 0 else 50.0
+            self.hits_records.append({
+                "d": self.chart_records[end_idx]["d"],
+                "a": round(acc, 1)
+            })
+
+    def to_json_dict(self) -> dict:
+        with self.lock:
+            kpis = getattr(self, 'latest_kpi', {
+                "last_close": "--", "date": "--", "forecast_pct": "--", "forecast_sub": "--",
+                "capacity": "--", "betti_1": "--", "mae": "--", "updates": "0", "regime": "NORMAL"
+            })
+            
+            return {
+                "meta": {
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "account": self.account_info.get("login", ""),
+                    "balance": f"{self.account_info.get('balance', 0.0):.2f}" if 'balance' in self.account_info else "--",
+                    "currency": self.account_info.get("currency", "USD"),
+                    "leverage": str(self.account_info.get("leverage", "100")),
+                    "server": self.account_info.get("server", ""),
+                    "trade_mode": self.account_info.get("trade_mode", "Demo")
+                },
+                "kpis": kpis,
+                "scenarios": self.scenarios,
+                "CHART": self.chart_records,
+                "PHASE": self.phase_points,
+                "HULL": self.hull_points,
+                "HITS": self.hits_records
+            }
+
+class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
+    state = None
+    dashboard_html_path = ""
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            try:
+                with open(self.dashboard_html_path, "r", encoding="utf-8") as f:
+                    self.wfile.write(f.read().encode("utf-8"))
+            except Exception as e:
+                self.wfile.write(f"Error loading dashboard: {e}".encode("utf-8"))
+        elif self.path == "/data":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            data_dict = self.state.to_json_dict()
+            self.wfile.write(json.dumps(data_dict).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+
+def start_dashboard_server(state: DashboardState, port: int = 8080, html_path: str = "dashboard.html"):
+    DashboardHTTPRequestHandler.state = state
+    DashboardHTTPRequestHandler.dashboard_html_path = html_path
+    
+    server = HTTPServer(("127.0.0.1", port), DashboardHTTPRequestHandler)
+    print(f"\n\033[92m[DASHBOARD] Live web dashboard available at: http://localhost:{port}\033[0m")
+    server.serve_forever()
+
+def get_convex_hull_vertices(points: np.ndarray) -> np.ndarray:
+    if len(points) < 3:
+        return np.empty((0, 2))
+    try:
+        hull = ConvexHull(points)
+        verts = points[hull.vertices]
+        return np.vstack([verts, verts[0]])
+    except Exception:
+        return np.empty((0, 2))
 
 
 # ===========================================================================
@@ -1081,7 +1317,7 @@ class SymplecticForecaster:
         df["time"] = pd.to_datetime(df["time"], unit="s")
 
         print(f"[MT5] Received {len(df)} bars.")
-        print(f"[MT5] Date range: {df['time'].iloc[0]} → {df['time'].iloc[-1]}")
+        print(f"[MT5] Date range: {df['time'].iloc[0]} to {df['time'].iloc[-1]}")
         print(f"[INFO] Running symplectic pipeline with window={self.window} ...")
 
         results = []
@@ -1106,6 +1342,11 @@ class SymplecticForecaster:
         if HAS_RIVER:
             print(f"[INFO] Final MAE (PA):  {self._model._mae_pa.get():.6f}")
             print(f"[INFO] Final MAE (HT):  {self._model._mae_ht.get():.6f}")
+            
+        global global_dashboard_state
+        if global_dashboard_state:
+            global_dashboard_state.load_historical_dataframe(rdf)
+            
         return rdf
 
     # ------------------------------------------------------------------ #
@@ -1203,6 +1444,22 @@ class SymplecticForecaster:
 
                 if out:
                     out["regime"] = "ALERT" if out.get("alert", False) else "NORMAL"
+                    
+                    global global_dashboard_state
+                    if global_dashboard_state:
+                        pts = np.array(list(self._phase_buf), dtype=float)
+                        hull_verts = get_convex_hull_vertices(pts)
+                        acc_info = connection.get_account_info() if connection else {}
+                        global_dashboard_state.update_live_metrics(
+                            symbol=symbol,
+                            timeframe=timeframe_str,
+                            latest_forecast=out,
+                            phase_buf=list(self._phase_buf),
+                            hull_points=hull_verts.tolist(),
+                            acc_info=acc_info,
+                            total_updates=self._model._n_updates
+                        )
+                    
                     if on_signal:
                         on_signal(out, symbol)
                     else:
@@ -1335,6 +1592,15 @@ Examples:
         print(f"\n[ERROR] {e}")
         sys.exit(1)
 
+    # Initialize and start Dashboard Server
+    global_dashboard_state = DashboardState()
+    srv_thread = threading.Thread(
+        target=start_dashboard_server,
+        args=(global_dashboard_state, 8080, os.path.join(os.path.dirname(__file__), "dashboard.html")),
+        daemon=True
+    )
+    srv_thread.start()
+
     engine = None  # declare for finally block
 
     try:
@@ -1392,7 +1658,24 @@ Examples:
                 **result,
                 "close": result["current_price"],
                 "alert": result["regime"] == "ALERT",
+                "capacity": result["current_capacity"],
+                "betti_1": result["current_betti_1"],
             }
+            
+            if global_dashboard_state:
+                pts = np.array(list(fc._phase_buf), dtype=float)
+                hull_verts = get_convex_hull_vertices(pts)
+                acc_info = conn.get_account_info() if conn else {}
+                global_dashboard_state.update_live_metrics(
+                    symbol=symbol,
+                    timeframe=tf_str,
+                    latest_forecast=initial_forecast,
+                    phase_buf=list(fc._phase_buf),
+                    hull_points=hull_verts.tolist(),
+                    acc_info=acc_info,
+                    total_updates=fc._model._n_updates
+                )
+                
             engine.on_signal(initial_forecast, symbol)
 
         # ── Step 7: Export training results ──
