@@ -167,6 +167,21 @@ python symplectic_forecaster.py
 run.bat
 ```
 
+### Live Web Dashboard
+
+Every time the forecaster is running, a local web server starts up automatically in the background.
+
+- **URL**: [http://localhost:8080](http://localhost:8080)
+- **Features**:
+  - **Dynamic Updates**: Real-time polling updates the charts in-place every 2 seconds.
+  - **Four Live Charts**:
+    - **Price & Capacity**: Price trend with overlaying ECH capacity $C(t)$ and alert indicators.
+    - **Phase Space**: Rolling $(q,p)$ phase coordinate point cloud and enclosing green convex hull polygon.
+    - **Topological Persistence**: Betti-1 ($\beta_1$) loop generator counts and total persistence scale.
+    - **Directional Accuracy**: Rolling 30-bar walking accuracy hit rate.
+  - **Forecast Panel**: Dynamic Bull, Bear, Base predictions and stability limits.
+  - **Theme Support**: Automatically adapts to your system Light/Dark mode.
+
 ### Command-Line Arguments
 
 ```bash
@@ -276,7 +291,8 @@ When the symplectic capacity `C(t)` spikes above the 95th percentile, it indicat
 
 ```
 symplectic-forecaster-mt5/
-├── symplectic_forecaster.py   # All-in-one: forecaster + MT5 + trading engine
+├── symplectic_forecaster.py   # Main engine + background server
+├── dashboard.html             # Dynamic HTML/JS dashboard page
 ├── run.bat                    # Windows launcher (auto-selects Python 3.11)
 ├── requirements.txt           # Python dependencies
 ├── LICENSE                    # MIT License
