@@ -65,8 +65,10 @@ import warnings
 import collections
 import argparse
 import datetime
-from dataclasses import dataclass, field
-from typing import NamedTuple, Optional, Dict, List, Tuple, Callable
+import pickle
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import NamedTuple, Optional, Dict, List, Tuple, Callable, Any
 
 import numpy as np
 import pandas as pd
@@ -96,17 +98,8 @@ except ImportError:
     from sklearn.linear_model import SGDRegressor
 
 try:
-    import os
-    IS_DOCKER = os.path.exists('/.dockerenv') or os.environ.get('IS_DOCKER') == 'true'
-    if IS_DOCKER:
-        from mt5linux import MetaTrader5
-        host_ip = os.environ.get('MT5_HOST', 'host.docker.internal')
-        mt5 = MetaTrader5(host=host_ip)
-        HAS_MT5 = True
-        print(f"[INFO] Running in Docker. Bridging to MT5 host at {host_ip} via mt5linux.")
-    else:
-        import MetaTrader5 as mt5
-        HAS_MT5 = True
+    import MetaTrader5 as mt5
+    HAS_MT5 = True
 except ImportError:
     HAS_MT5 = False
     print("[ERROR] MetaTrader5 package not found.")
@@ -484,6 +477,525 @@ class TradingEngine:
             "buys":  self._signal_count["BUY"],
             "sells": self._signal_count["SELL"],
             "holds": self._signal_count["HOLD"],
+        }
+
+    def hold_diagnostics(self) -> Dict[str, int]:
+        """Count why HOLD signals were issued."""
+        buckets = {
+            "low_confidence": 0,
+            "alert_regime": 0,
+            "neutral_direction": 0,
+            "other": 0,
+        }
+        for sig in self.signal_log:
+            if sig.action != "HOLD":
+                continue
+            reason = sig.reason.lower()
+            if "alert" in reason or "bifurcation" in reason:
+                buckets["alert_regime"] += 1
+            elif "confidence" in reason:
+                buckets["low_confidence"] += 1
+            elif "neutral" in reason:
+                buckets["neutral_direction"] += 1
+            else:
+                buckets["other"] += 1
+        return buckets
+
+
+# ===========================================================================
+# RISK MANAGEMENT & AUTO-EXECUTION
+# ===========================================================================
+
+@dataclass
+class RiskConfig:
+    """Risk parameters for automated trade execution."""
+    risk_per_trade_pct: float = 1.0
+    max_daily_loss_pct: float = 3.0
+    reward_risk_ratio: float = 2.0
+    atr_period: int = 14
+    atr_sl_multiplier: float = 1.5
+    trailing_atr_multiplier: float = 1.0
+    max_positions: int = 1
+    magic_number: int = 20260611
+    min_stop_pips: float = 10.0
+    use_stability_bands: bool = True
+    allow_live: bool = False
+
+
+@dataclass
+class TradeResult:
+    success: bool
+    action: str
+    message: str
+    ticket: int = 0
+    volume: float = 0.0
+    price: float = 0.0
+    sl: float = 0.0
+    tp: float = 0.0
+
+
+class RiskManager:
+    """Position sizing, daily loss limits, and trade permission checks."""
+
+    def __init__(self, config: RiskConfig):
+        self.config = config
+        self._session_start_equity: Optional[float] = None
+        self._session_date: Optional[datetime.date] = None
+        self._trading_halted = False
+        self._halt_reason = ""
+
+    def reset_session(self):
+        """Reset daily tracking (call at bot startup or new trading day)."""
+        acc = mt5.account_info()
+        if acc:
+            self._session_start_equity = acc.equity
+            self._session_date = datetime.date.today()
+            self._trading_halted = False
+            self._halt_reason = ""
+
+    def _roll_session_if_new_day(self):
+        today = datetime.date.today()
+        if self._session_date != today:
+            self.reset_session()
+
+    def can_trade(self) -> Tuple[bool, str]:
+        """Return (allowed, reason)."""
+        if not HAS_MT5:
+            return False, "MT5 not available"
+        if self._trading_halted:
+            return False, self._halt_reason
+
+        self._roll_session_if_new_day()
+        acc = mt5.account_info()
+        if acc is None:
+            return False, "No account info"
+
+        if self._session_start_equity is None:
+            self.reset_session()
+
+        if self.config.max_daily_loss_pct > 0 and self._session_start_equity > 0:
+            daily_loss_pct = (
+                (self._session_start_equity - acc.equity)
+                / self._session_start_equity * 100.0
+            )
+            if daily_loss_pct >= self.config.max_daily_loss_pct:
+                self._trading_halted = True
+                self._halt_reason = (
+                    f"Daily loss limit hit: {daily_loss_pct:.2f}% "
+                    f"(max {self.config.max_daily_loss_pct:.1f}%)"
+                )
+                return False, self._halt_reason
+
+        return True, "OK"
+
+    def calculate_lot_size(self, symbol: str, stop_distance: float) -> float:
+        """Size position so stop loss risks `risk_per_trade_pct` of equity."""
+        acc = mt5.account_info()
+        sym = mt5.symbol_info(symbol)
+        if acc is None or sym is None or stop_distance <= 0:
+            return sym.volume_min if sym else 0.01
+
+        risk_amount = acc.equity * (self.config.risk_per_trade_pct / 100.0)
+        tick_value = sym.trade_tick_value
+        tick_size = sym.trade_tick_size
+        if tick_size <= 0 or tick_value <= 0:
+            return sym.volume_min
+
+        value_per_price_unit = tick_value / tick_size
+        loss_per_lot = stop_distance * value_per_price_unit
+        if loss_per_lot <= 0:
+            return sym.volume_min
+
+        lots = risk_amount / loss_per_lot
+        step = sym.volume_step
+        lots = math.floor(lots / step) * step
+        lots = max(sym.volume_min, min(sym.volume_max, lots))
+        return round(lots, 2)
+
+    def compute_atr(self, symbol: str, timeframe: int, period: int) -> float:
+        """Average True Range from recent MT5 bars."""
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, period + 1)
+        if rates is None or len(rates) < 2:
+            return 0.0
+
+        trs = []
+        for i in range(1, len(rates)):
+            high = float(rates[i]["high"])
+            low = float(rates[i]["low"])
+            prev_close = float(rates[i - 1]["close"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+        return float(np.mean(trs)) if trs else 0.0
+
+
+class MT5TradeExecutor:
+    """Places and manages orders via the MT5 Python API."""
+
+    def __init__(self, risk_config: RiskConfig, connection: MT5Connection = None):
+        if not HAS_MT5:
+            raise ImportError("MetaTrader5 package not installed.")
+        self.risk = RiskManager(risk_config)
+        self.config = risk_config
+        self.connection = connection
+        self.trade_log: List[TradeResult] = []
+        self._trade_count = {"OPEN": 0, "CLOSE": 0, "MODIFY": 0, "SKIP": 0, "ERROR": 0}
+        self.risk.reset_session()
+
+    def _is_live_account(self) -> bool:
+        acc = mt5.account_info()
+        return acc is not None and acc.trade_mode == 2
+
+    def _check_live_permission(self) -> Tuple[bool, str]:
+        if self._is_live_account() and not self.config.allow_live:
+            return False, (
+                "Live account detected. Pass --allow-live to enable real-money trading."
+            )
+        return True, "OK"
+
+    def _filling_mode(self, symbol: str) -> int:
+        sym = mt5.symbol_info(symbol)
+        if sym is None:
+            return mt5.ORDER_FILLING_IOC
+        filling = sym.filling_mode
+        if filling & 1:
+            return mt5.ORDER_FILLING_FOK
+        if filling & 2:
+            return mt5.ORDER_FILLING_IOC
+        return mt5.ORDER_FILLING_RETURN
+
+    def get_positions(self, symbol: str) -> List:
+        """Open positions for this bot's magic number."""
+        positions = mt5.positions_get(symbol=symbol)
+        if positions is None:
+            return []
+        return [p for p in positions if p.magic == self.config.magic_number]
+
+    def _normalize_price(self, symbol: str, price: float) -> float:
+        sym = mt5.symbol_info(symbol)
+        if sym is None:
+            return price
+        return round(price, sym.digits)
+
+    def _min_stop_distance(self, symbol: str) -> float:
+        sym = mt5.symbol_info(symbol)
+        if sym is None:
+            return 0.0
+        stops_level = sym.trade_stops_level
+        point = sym.point
+        min_pips_dist = self.config.min_stop_pips * point * (
+            10 if sym.digits in (3, 5) else 1
+        )
+        return max(stops_level * point, min_pips_dist)
+
+    def compute_sl_tp(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        forecast: Dict,
+        timeframe: int,
+    ) -> Tuple[float, float, float]:
+        """
+        Compute stop-loss, take-profit, and stop distance.
+
+        Uses symplectic stability bands when available, otherwise ATR.
+        """
+        sym = mt5.symbol_info(symbol)
+        if sym is None:
+            return 0.0, 0.0, 0.0
+
+        min_dist = self._min_stop_distance(symbol)
+        sl_dist = 0.0
+
+        if self.config.use_stability_bands and forecast:
+            lower = forecast.get("lower_band") or []
+            upper = forecast.get("upper_band") or []
+            if direction == "BUY" and lower:
+                sl = float(lower[0])
+                sl_dist = max(entry_price - sl, min_dist)
+            elif direction == "SELL" and upper:
+                sl = float(upper[0])
+                sl_dist = max(sl - entry_price, min_dist)
+            else:
+                sl_dist = 0.0
+
+        if sl_dist <= 0:
+            atr = self.risk.compute_atr(symbol, timeframe, self.config.atr_period)
+            sl_dist = max(atr * self.config.atr_sl_multiplier, min_dist)
+
+        if direction == "BUY":
+            sl = self._normalize_price(symbol, entry_price - sl_dist)
+            tp = self._normalize_price(
+                symbol, entry_price + sl_dist * self.config.reward_risk_ratio
+            )
+        else:
+            sl = self._normalize_price(symbol, entry_price + sl_dist)
+            tp = self._normalize_price(
+                symbol, entry_price - sl_dist * self.config.reward_risk_ratio
+            )
+        return sl, tp, sl_dist
+
+    def open_position(
+        self,
+        symbol: str,
+        direction: str,
+        forecast: Dict,
+        timeframe: int,
+    ) -> TradeResult:
+        """Open a market order with risk-based lot sizing."""
+        allowed, reason = self.risk.can_trade()
+        if not allowed:
+            self._trade_count["SKIP"] += 1
+            return TradeResult(False, "SKIP", reason)
+
+        live_ok, live_msg = self._check_live_permission()
+        if not live_ok:
+            self._trade_count["SKIP"] += 1
+            return TradeResult(False, "SKIP", live_msg)
+
+        positions = self.get_positions(symbol)
+        if len(positions) >= self.config.max_positions:
+            self._trade_count["SKIP"] += 1
+            return TradeResult(
+                False, "SKIP",
+                f"Max positions ({self.config.max_positions}) already open."
+            )
+
+        tick = mt5.symbol_info_tick(symbol)
+        sym = mt5.symbol_info(symbol)
+        if tick is None or sym is None:
+            self._trade_count["ERROR"] += 1
+            return TradeResult(False, "ERROR", "No tick/symbol info")
+
+        if direction == "BUY":
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+        else:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+
+        sl, tp, sl_dist = self.compute_sl_tp(symbol, direction, price, forecast, timeframe)
+        volume = self.risk.calculate_lot_size(symbol, sl_dist)
+        if volume < sym.volume_min:
+            self._trade_count["SKIP"] += 1
+            return TradeResult(
+                False, "SKIP",
+                f"Calculated lot {volume} below minimum {sym.volume_min}"
+            )
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 20,
+            "magic": self.config.magic_number,
+            "comment": "symplectic_bot",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._filling_mode(symbol),
+        }
+        result = mt5.order_send(request)
+        if result is None:
+            self._trade_count["ERROR"] += 1
+            return TradeResult(False, "ERROR", f"order_send failed: {mt5.last_error()}")
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            self._trade_count["ERROR"] += 1
+            return TradeResult(
+                False, "ERROR",
+                f"Order rejected: {result.retcode} — {result.comment}"
+            )
+
+        self._trade_count["OPEN"] += 1
+        trade = TradeResult(
+            True, "OPEN",
+            f"{direction} {volume} lots @ {result.price:.5f} | SL={sl:.5f} TP={tp:.5f}",
+            ticket=result.order, volume=volume, price=result.price, sl=sl, tp=tp,
+        )
+        self.trade_log.append(trade)
+        return trade
+
+    def close_position(self, position) -> TradeResult:
+        """Close an open position by ticket."""
+        tick = mt5.symbol_info_tick(position.symbol)
+        if tick is None:
+            self._trade_count["ERROR"] += 1
+            return TradeResult(False, "ERROR", "No tick for close")
+
+        if position.type == mt5.POSITION_TYPE_BUY:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        else:
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": order_type,
+            "position": position.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": self.config.magic_number,
+            "comment": "symplectic_close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._filling_mode(position.symbol),
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            self._trade_count["ERROR"] += 1
+            err = result.comment if result else str(mt5.last_error())
+            return TradeResult(False, "ERROR", f"Close failed: {err}")
+
+        self._trade_count["CLOSE"] += 1
+        trade = TradeResult(
+            True, "CLOSE",
+            f"Closed #{position.ticket} {position.volume} lots @ {result.price:.5f}",
+            ticket=position.ticket, volume=position.volume, price=result.price,
+        )
+        self.trade_log.append(trade)
+        return trade
+
+    def close_all(self, symbol: str) -> List[TradeResult]:
+        """Close all bot positions on symbol."""
+        results = []
+        for pos in self.get_positions(symbol):
+            results.append(self.close_position(pos))
+        return results
+
+    def modify_sl(self, position, new_sl: float) -> TradeResult:
+        """Modify stop-loss on an open position."""
+        new_sl = self._normalize_price(position.symbol, new_sl)
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": position.ticket,
+            "sl": new_sl,
+            "tp": position.tp,
+            "magic": self.config.magic_number,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            self._trade_count["ERROR"] += 1
+            err = result.comment if result else str(mt5.last_error())
+            return TradeResult(False, "ERROR", f"SL modify failed: {err}")
+
+        self._trade_count["MODIFY"] += 1
+        trade = TradeResult(
+            True, "MODIFY",
+            f"#{position.ticket} SL -> {new_sl:.5f}",
+            ticket=position.ticket, sl=new_sl,
+        )
+        self.trade_log.append(trade)
+        return trade
+
+    def manage_trailing_stops(self, symbol: str, timeframe: int):
+        """Trail stop-loss on open positions using ATR distance."""
+        atr = self.risk.compute_atr(symbol, timeframe, self.config.atr_period)
+        if atr <= 0:
+            return
+
+        trail_dist = atr * self.config.trailing_atr_multiplier
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return
+
+        for pos in self.get_positions(symbol):
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                new_sl = tick.bid - trail_dist
+                if pos.sl == 0 or new_sl > pos.sl + mt5.symbol_info(symbol).point:
+                    if new_sl < tick.bid:
+                        self.modify_sl(pos, new_sl)
+            else:
+                new_sl = tick.ask + trail_dist
+                if pos.sl == 0 or new_sl < pos.sl - mt5.symbol_info(symbol).point:
+                    if new_sl > tick.ask:
+                        self.modify_sl(pos, new_sl)
+
+    def summary(self) -> Dict:
+        return dict(self._trade_count, total_trades=len(self.trade_log))
+
+
+class AutoTradingEngine(TradingEngine):
+    """
+    Extends TradingEngine with MT5 order execution.
+
+    On each new bar:
+      BUY  → close shorts, open long (if risk allows)
+      SELL → close longs, open short (if risk allows)
+      HOLD → manage trailing stops only
+    """
+
+    def __init__(
+        self,
+        executor: MT5TradeExecutor,
+        confidence_threshold: float = 0.6,
+        timeframe: int = None,
+    ):
+        super().__init__(confidence_threshold)
+        self.executor = executor
+        self.timeframe = timeframe
+
+    def on_signal(self, forecast: Dict, symbol: str):
+        """Evaluate signal, print it, and execute trades when appropriate."""
+        signal = self.evaluate(forecast, symbol)
+        self.print_signal(signal)
+
+        if self.timeframe is None:
+            return
+
+        # Always manage trailing stops on open positions
+        self.executor.manage_trailing_stops(symbol, self.timeframe)
+
+        if signal.action == "HOLD":
+            return
+
+        positions = self.executor.get_positions(symbol)
+        longs = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
+        shorts = [p for p in positions if p.type == mt5.POSITION_TYPE_SELL]
+
+        if signal.action == "BUY":
+            for pos in shorts:
+                result = self.executor.close_position(pos)
+                self._print_trade(result)
+            if not longs:
+                result = self.executor.open_position(
+                    symbol, "BUY", forecast, self.timeframe
+                )
+                self._print_trade(result)
+
+        elif signal.action == "SELL":
+            for pos in longs:
+                result = self.executor.close_position(pos)
+                self._print_trade(result)
+            if not shorts:
+                result = self.executor.open_position(
+                    symbol, "SELL", forecast, self.timeframe
+                )
+                self._print_trade(result)
+
+    def on_poll(self, symbol: str):
+        """Called between bars to update trailing stops."""
+        if self.timeframe is not None:
+            self.executor.manage_trailing_stops(symbol, self.timeframe)
+
+    def _print_trade(self, result: TradeResult):
+        GREEN = "\033[92m"
+        RED = "\033[91m"
+        YELLOW = "\033[93m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+        color = GREEN if result.success else (YELLOW if result.action == "SKIP" else RED)
+        print(f"  {color}{BOLD}[TRADE] {result.action}{RESET} — {result.message}")
+
+    def trade_summary(self) -> Dict:
+        return {
+            "signals": self.summary(),
+            "trades": self.executor.summary(),
         }
 
 
@@ -996,22 +1508,51 @@ class SymplecticOnlineModel:
             self._skl_model.partial_fit(X_sc, [target])
         self._n_updates += 1
 
+    @staticmethod
+    def _compute_confidence(
+        forecast: float,
+        feats: Dict[str, float],
+        p_pa: float = 0.0,
+        p_ht: float = 0.0,
+    ) -> float:
+        """
+        Confidence score tuned for forex-scale log-returns.
+
+        Old formula (ensemble agreement only) collapsed toward 0 when PA and HT
+        predicted tiny returns — even when they agreed. This blends:
+          • ensemble agreement (River only)
+          • forecast magnitude vs rolling volatility (signal strength)
+        """
+        vol = max(feats.get("vol_20", 0.0), feats.get("vol_10", 0.0), 1e-6)
+
+        if HAS_RIVER:
+            scale = max(abs(p_pa), abs(p_ht), vol * 0.5, 1e-8)
+            agreement = 1.0 - min(1.0, abs(p_pa - p_ht) / scale)
+            if np.sign(p_pa) != np.sign(p_ht) and abs(p_pa) > vol * 0.05 and abs(p_ht) > vol * 0.05:
+                agreement *= 0.4
+        else:
+            agreement = 0.55
+
+        magnitude = min(1.0, abs(forecast) / (vol * 1.2 + 1e-12))
+        conf = 0.30 * agreement + 0.70 * magnitude
+        return float(np.clip(conf, 0, 1))
+
     def predict_one(self, feats: Dict[str, float]) -> Dict[str, float]:
         """
         Return a prediction dictionary:
             forecast   : expected next log-return
             direction  : +1 (bullish) / -1 (bearish)
-            confidence : 0..1  (ensemble agreement)
+            confidence : 0..1  (magnitude + ensemble agreement)
         """
+        p_pa = 0.0
+        p_ht = 0.0
         if HAS_RIVER:
             p_pa = self._pa.predict_one(feats) or 0.0
             p_ht = self._ht.predict_one(feats) or 0.0
-            # Weight by inverse recent MAE
             w_pa  = 1.0 / (self._rmse_pa + 1e-12)
             w_ht  = 1.0 / (self._rmse_ht + 1e-12)
             total = w_pa + w_ht
             forecast = (w_pa * p_pa + w_ht * p_ht) / total
-            conf     = 1.0 - abs(p_pa - p_ht) / (abs(p_pa) + abs(p_ht) + 1e-12)
         else:
             X = np.array(list(feats.values())).reshape(1, -1)
             if not self._skl_fitted:
@@ -1020,18 +1561,64 @@ class SymplecticOnlineModel:
             try:
                 X_sc     = self._skl_scaler.transform(X)
                 raw_fc   = float(self._skl_model.predict(X_sc)[0])
-                # Clip: daily log-returns physically cannot exceed ±15%
                 forecast = float(np.clip(raw_fc, -0.15, 0.15))
             except Exception:
                 forecast = 0.0
-            conf = 0.5
 
-        direction = int(np.sign(forecast)) if abs(forecast) > 1e-8 else 0
+        vol = max(feats.get("vol_20", 0.0), feats.get("vol_10", 0.0), 1e-6)
+        if abs(forecast) < vol * 0.05:
+            direction = 0
+        else:
+            direction = int(np.sign(forecast))
+
+        conf = self._compute_confidence(forecast, feats, p_pa, p_ht)
         return dict(forecast=forecast, direction=direction,
-                    confidence=float(np.clip(conf, 0, 1)),
+                    confidence=conf,
                     mae_pa=self._mae_pa.get() if HAS_RIVER else None,
                     mae_ht=self._mae_ht.get() if HAS_RIVER else None,
                     n_updates=self._n_updates)
+
+    def export_state(self) -> Dict[str, Any]:
+        """Serialize model weights and metrics for persistence."""
+        state: Dict[str, Any] = {
+            "backend": "river" if HAS_RIVER else "sklearn",
+            "n_updates": self._n_updates,
+            "rmse_pa": self._rmse_pa,
+            "rmse_ht": self._rmse_ht,
+        }
+        if HAS_RIVER:
+            state["pa"] = self._pa
+            state["ht"] = self._ht
+            state["mae_pa"] = self._mae_pa
+            state["mae_ht"] = self._mae_ht
+        else:
+            state["skl_model"] = self._skl_model
+            state["skl_scaler"] = self._skl_scaler
+            state["skl_fitted"] = self._skl_fitted
+        return state
+
+    def import_state(self, state: Dict[str, Any]) -> None:
+        """Restore model from a previously exported state dict."""
+        saved_backend = state.get("backend")
+        current_backend = "river" if HAS_RIVER else "sklearn"
+        if saved_backend != current_backend:
+            raise ValueError(
+                f"State backend '{saved_backend}' does not match current "
+                f"environment '{current_backend}'. Install matching deps "
+                f"(river vs sklearn-only)."
+            )
+        self._n_updates = state.get("n_updates", 0)
+        self._rmse_pa = state.get("rmse_pa", 0.001)
+        self._rmse_ht = state.get("rmse_ht", 0.001)
+        if HAS_RIVER:
+            self._pa = state["pa"]
+            self._ht = state["ht"]
+            self._mae_pa = state["mae_pa"]
+            self._mae_ht = state["mae_ht"]
+        else:
+            self._skl_model = state["skl_model"]
+            self._skl_scaler = state["skl_scaler"]
+            self._skl_fitted = state.get("skl_fitted", True)
 
 
 # ===========================================================================
@@ -1172,6 +1759,7 @@ class SymplecticForecaster:
         self._last_record    : Optional[CapacityRecord] = None
         self._last_feats     : Optional[Dict] = None
         self._last_price     : float = 0.0
+        self._freeze_learning: bool = False
 
     # ------------------------------------------------------------------ #
     # CORE PROCESSING STEP
@@ -1233,7 +1821,8 @@ class SymplecticForecaster:
 
         # Step 6 — online model update
         # We learn on the PREVIOUS bar's features → CURRENT bar's log-return
-        if self._last_feats is not None and self._bar_count > 2:
+        if (not self._freeze_learning
+                and self._last_feats is not None and self._bar_count > 2):
             self._model.learn_one(self._last_feats, log_ret)
 
         # Build current feature vector
@@ -1366,6 +1955,7 @@ class SymplecticForecaster:
                      timeframe_str: str = "D1",
                      poll_interval: float = 0.0,
                      on_signal: Callable = None,
+                     on_poll: Callable = None,
                      connection: MT5Connection = None) -> None:
         """
         Continuous live monitoring loop using MetaTrader 5.
@@ -1374,7 +1964,8 @@ class SymplecticForecaster:
         2. Processes it through the symplectic pipeline
         3. Generates forecast + trading signal
         4. Calls on_signal(forecast_dict, symbol) callback
-        5. Sleeps and repeats
+        5. Calls on_poll(symbol) each cycle (e.g. trailing stops)
+        6. Sleeps and repeats
 
         Press Ctrl+C to stop.
 
@@ -1384,6 +1975,7 @@ class SymplecticForecaster:
         timeframe_str   : timeframe string (e.g., "D1", "H1", "M5")
         poll_interval   : seconds between polls (0 = auto-detect from timeframe)
         on_signal       : callback(forecast_dict, symbol) for each new bar
+        on_poll         : callback(symbol) each poll cycle (between bars)
         connection      : MT5Connection instance
         """
         if not HAS_MT5:
@@ -1428,7 +2020,8 @@ class SymplecticForecaster:
                 bar_time = int(latest_complete["time"])
 
                 if bar_time <= last_bar_time:
-                    # No new completed bar yet — still waiting
+                    if on_poll:
+                        on_poll(symbol)
                     time.sleep(poll_interval)
                     continue
 
@@ -1527,6 +2120,182 @@ class SymplecticForecaster:
                     **pred, **scenarios)
 
     # ------------------------------------------------------------------ #
+    # MODEL STATE PERSISTENCE
+    # ------------------------------------------------------------------ #
+
+    STATE_VERSION = 1
+    _MAX_RECORD_HIST = 500
+
+    @staticmethod
+    def default_state_path(symbol: str, timeframe: str,
+                           state_dir: str = "states") -> Path:
+        """Default pickle path: states/EURUSD_H1.pkl"""
+        Path(state_dir).mkdir(parents=True, exist_ok=True)
+        return Path(state_dir) / f"{symbol.upper()}_{timeframe.upper()}.pkl"
+
+    @staticmethod
+    def _bar_to_dict(bar: Optional[Bar]) -> Optional[Dict]:
+        if bar is None:
+            return None
+        return dict(
+            timestamp=bar.timestamp, open=bar.open, high=bar.high,
+            low=bar.low, close=bar.close, volume=bar.volume,
+        )
+
+    @staticmethod
+    def _bar_from_dict(d: Optional[Dict]) -> Optional[Bar]:
+        if d is None:
+            return None
+        return Bar(**d)
+
+    @staticmethod
+    def _rec_to_dict(rec: Optional[CapacityRecord]) -> Optional[Dict]:
+        return asdict(rec) if rec else None
+
+    @staticmethod
+    def _rec_from_dict(d: Optional[Dict]) -> Optional[CapacityRecord]:
+        return CapacityRecord(**d) if d else None
+
+    def export_state(self, symbol: str, timeframe: str) -> Dict[str, Any]:
+        """Export full forecaster state (buffers + model) to a dict."""
+        return {
+            "version": self.STATE_VERSION,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe.upper(),
+            "saved_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "config": {
+                "window": self.window,
+                "alert_pct": self.alert_pct,
+                "tda_subsample": self.tda_subsample,
+                "min_train_bars": self.min_train_bars,
+            },
+            "bar_count": self._bar_count,
+            "last_price": self._last_price,
+            "phase_buf": list(self._phase_buf),
+            "capacity_buf": list(self._capacity_buf),
+            "record_hist": [asdict(r) for r in self._record_hist[-self._MAX_RECORD_HIST:]],
+            "prev_bar": self._bar_to_dict(self._prev_bar),
+            "last_record": self._rec_to_dict(self._last_record),
+            "last_feats": self._last_feats,
+            "model": self._model.export_state(),
+        }
+
+    def import_state(self, state: Dict[str, Any],
+                     symbol: str = None, timeframe: str = None) -> None:
+        """Restore forecaster from a previously saved state dict."""
+        if state.get("version") != self.STATE_VERSION:
+            raise ValueError(
+                f"Unsupported state version {state.get('version')}. "
+                f"Expected {self.STATE_VERSION}."
+            )
+        if symbol and state.get("symbol") != symbol.upper():
+            raise ValueError(
+                f"State symbol {state.get('symbol')} != requested {symbol.upper()}"
+            )
+        if timeframe and state.get("timeframe") != timeframe.upper():
+            raise ValueError(
+                f"State timeframe {state.get('timeframe')} != requested {timeframe.upper()}"
+            )
+
+        cfg = state["config"]
+        self.window = cfg["window"]
+        self.alert_pct = cfg["alert_pct"]
+        self.tda_subsample = cfg["tda_subsample"]
+        self.min_train_bars = cfg["min_train_bars"]
+
+        self._phase_buf = collections.deque(state["phase_buf"], maxlen=self.window)
+        self._capacity_buf = collections.deque(state["capacity_buf"], maxlen=500)
+        self._record_hist = [CapacityRecord(**d) for d in state["record_hist"]]
+        self._bar_count = state["bar_count"]
+        self._last_price = state["last_price"]
+        self._prev_bar = self._bar_from_dict(state.get("prev_bar"))
+        self._last_record = self._rec_from_dict(state.get("last_record"))
+        self._last_feats = state.get("last_feats")
+        self._model.import_state(state["model"])
+
+    def save_state(self, path: str, symbol: str, timeframe: str) -> str:
+        """Persist forecaster state to a pickle file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.export_state(symbol, timeframe)
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        print(f"[STATE] Saved model state -> {path}")
+        print(f"[STATE] Updates: {self._model._n_updates} | "
+              f"Bars processed: {self._bar_count}")
+        return str(path)
+
+    def load_state(self, path: str, symbol: str = None,
+                   timeframe: str = None) -> Dict[str, Any]:
+        """Load forecaster state from a pickle file."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"State file not found: {path}")
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        self.import_state(payload, symbol=symbol, timeframe=timeframe)
+        print(f"[STATE] Loaded model state <- {path}")
+        print(f"[STATE] Saved at: {payload.get('saved_at', 'unknown')}")
+        print(f"[STATE] Updates: {self._model._n_updates} | "
+              f"Bars processed: {self._bar_count}")
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # BACKTEST
+    # ------------------------------------------------------------------ #
+
+    def collect_bar_forecasts(
+        self,
+        bars: List[Bar],
+        freeze_model: bool = True,
+    ) -> List[Tuple[int, Bar, Optional[Dict]]]:
+        """Process bars once and cache forecasts (for optimizer / replay)."""
+        cache: List[Tuple[int, Bar, Optional[Dict]]] = []
+        prev_freeze = self._freeze_learning
+        self._freeze_learning = freeze_model
+        try:
+            for i, bar in enumerate(bars):
+                out = self.process_bar(bar)
+                if out is not None:
+                    out["regime"] = "ALERT" if out.get("alert", False) else "NORMAL"
+                cache.append((i, bar, out))
+        finally:
+            self._freeze_learning = prev_freeze
+        return cache
+
+    def run_backtest(
+        self,
+        symbol: str,
+        timeframe_str: str,
+        bars: List[Bar],
+        engine: TradingEngine,
+        risk_config: RiskConfig,
+        initial_balance: float = 10000.0,
+        spread_pips: float = 1.0,
+        freeze_model: bool = False,
+        symbol_spec: "SymbolSpec" = None,
+        forecast_cache: List[Tuple[int, Bar, Optional[Dict]]] = None,
+    ) -> "BacktestResult":
+        """
+        Walk-forward backtest over a list of bars with simulated fills.
+
+        Processes each bar through the symplectic pipeline, evaluates signals,
+        and simulates SL/TP/trailing-stop execution without placing real orders.
+        """
+        if forecast_cache is None:
+            forecast_cache = self.collect_bar_forecasts(bars, freeze_model=freeze_model)
+        return simulate_backtest_from_cache(
+            forecast_cache=forecast_cache,
+            bars=bars,
+            symbol=symbol,
+            engine=engine,
+            risk_config=risk_config,
+            initial_balance=initial_balance,
+            spread_pips=spread_pips,
+            symbol_spec=symbol_spec,
+        )
+
+    # ------------------------------------------------------------------ #
     # EXPORT
     # ------------------------------------------------------------------ #
 
@@ -1534,6 +2303,813 @@ class SymplecticForecaster:
         """Save the results DataFrame to CSV for further analysis."""
         df.to_csv(path, index=False)
         print(f"[INFO] Results saved to {path}")
+
+
+# ===========================================================================
+# BACKTEST SIMULATOR
+# ===========================================================================
+
+@dataclass
+class SymbolSpec:
+    """Cached symbol properties for offline lot/price calculations."""
+    point: float
+    digits: int
+    volume_min: float
+    volume_max: float
+    volume_step: float
+    tick_value: float
+    tick_size: float
+    trade_stops_level: int
+
+    @classmethod
+    def from_mt5(cls, symbol: str) -> "SymbolSpec":
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise ValueError(f"Cannot load symbol info for {symbol}")
+        return cls(
+            point=info.point,
+            digits=info.digits,
+            volume_min=info.volume_min,
+            volume_max=info.volume_max,
+            volume_step=info.volume_step,
+            tick_value=info.trade_tick_value,
+            tick_size=info.trade_tick_size,
+            trade_stops_level=info.trade_stops_level,
+        )
+
+
+@dataclass
+class SimPosition:
+    direction: str
+    entry_price: float
+    volume: float
+    sl: float
+    tp: float
+    entry_time: float
+    entry_bar_idx: int
+
+
+@dataclass
+class ClosedTrade:
+    direction: str
+    entry_price: float
+    exit_price: float
+    volume: float
+    pnl: float
+    entry_time: float
+    exit_time: float
+    exit_reason: str
+
+
+@dataclass
+class BacktestResult:
+    initial_balance: float
+    final_balance: float
+    total_return_pct: float
+    total_trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    profit_factor: float
+    max_drawdown_pct: float
+    sharpe_ratio: float
+    signal_summary: Dict
+    trades: List[ClosedTrade]
+    equity_curve: List[Tuple[float, float]]
+    hold_diagnostics: Dict[str, int] = field(default_factory=dict)
+    confidence_stats: Dict[str, float] = field(default_factory=dict)
+    params: Dict[str, float] = field(default_factory=dict)
+
+
+def simulate_backtest_from_cache(
+    forecast_cache: List[Tuple[int, Bar, Optional[Dict]]],
+    bars: List[Bar],
+    symbol: str,
+    engine: TradingEngine,
+    risk_config: RiskConfig,
+    initial_balance: float,
+    spread_pips: float,
+    symbol_spec: SymbolSpec,
+) -> BacktestResult:
+    """Run simulation on pre-computed bar forecasts (fast param sweeps)."""
+    sim = BacktestSimulator(
+        symbol=symbol,
+        initial_balance=initial_balance,
+        risk_config=risk_config,
+        spread_pips=spread_pips,
+        symbol_spec=symbol_spec,
+    )
+    engine.signal_log.clear()
+    engine._signal_count = {"BUY": 0, "SELL": 0, "HOLD": 0}
+    confidences: List[float] = []
+
+    for i, bar, out in forecast_cache:
+        sim.update_trailing(bar, bars, i, risk_config)
+
+        if sim.position is not None:
+            exit_reason = sim.check_exit(bar)
+            if exit_reason:
+                sim.close_position(bar, exit_reason)
+
+        if out is None:
+            sim.record_equity(bar.timestamp, bar.close)
+            continue
+
+        confidences.append(out.get("confidence", 0.0))
+        signal = engine.evaluate(out, symbol)
+
+        if signal.action in ("BUY", "SELL"):
+            if sim.position is not None:
+                if (
+                    (signal.action == "BUY" and sim.position.direction == "SELL")
+                    or (signal.action == "SELL" and sim.position.direction == "BUY")
+                ):
+                    sim.close_position(bar, "REVERSE")
+            if sim.position is None:
+                sim.open_position(
+                    direction=signal.action,
+                    bar=bar,
+                    bars=bars,
+                    bar_idx=i,
+                    forecast=out,
+                    risk_config=risk_config,
+                )
+
+        sim.record_equity(bar.timestamp, bar.close)
+
+    if sim.position is not None and bars:
+        sim.close_position(bars[-1], "END")
+
+    result = sim.build_result(engine)
+    result.hold_diagnostics = engine.hold_diagnostics()
+    if confidences:
+        arr = np.array(confidences)
+        result.confidence_stats = {
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+            "mean": float(arr.mean()),
+            "median": float(np.median(arr)),
+            "above_threshold": float(np.mean(arr >= engine.confidence_threshold)),
+        }
+    return result
+
+
+def _spread_price(spec: SymbolSpec, spread_pips: float) -> float:
+    pip_mult = 10 if spec.digits in (3, 5) else 1
+    return spread_pips * spec.point * pip_mult
+
+
+def _compute_atr_from_bars(bars: List[Bar], end_idx: int, period: int) -> float:
+    if end_idx < 1:
+        return 0.0
+    start = max(1, end_idx - period + 1)
+    trs = []
+    for i in range(start, end_idx + 1):
+        high, low = bars[i].high, bars[i].low
+        prev_close = bars[i - 1].close
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return float(np.mean(trs)) if trs else 0.0
+
+
+def _compute_sl_tp_backtest(
+    direction: str,
+    entry_price: float,
+    forecast: Dict,
+    bars: List[Bar],
+    bar_idx: int,
+    risk_config: RiskConfig,
+    spec: SymbolSpec,
+) -> Tuple[float, float, float]:
+    """Mirror MT5TradeExecutor SL/TP logic using bar history for ATR."""
+    min_dist = max(
+        spec.trade_stops_level * spec.point,
+        risk_config.min_stop_pips * spec.point * (10 if spec.digits in (3, 5) else 1),
+    )
+    sl_dist = 0.0
+
+    if risk_config.use_stability_bands and forecast:
+        lower = forecast.get("lower_band") or []
+        upper = forecast.get("upper_band") or []
+        if direction == "BUY" and lower:
+            sl_dist = max(entry_price - float(lower[0]), min_dist)
+        elif direction == "SELL" and upper:
+            sl_dist = max(float(upper[0]) - entry_price, min_dist)
+
+    if sl_dist <= 0:
+        atr = _compute_atr_from_bars(bars, bar_idx, risk_config.atr_period)
+        sl_dist = max(atr * risk_config.atr_sl_multiplier, min_dist)
+
+    if direction == "BUY":
+        sl = round(entry_price - sl_dist, spec.digits)
+        tp = round(entry_price + sl_dist * risk_config.reward_risk_ratio, spec.digits)
+    else:
+        sl = round(entry_price + sl_dist, spec.digits)
+        tp = round(entry_price - sl_dist * risk_config.reward_risk_ratio, spec.digits)
+    return sl, tp, sl_dist
+
+
+def _calc_lot_backtest(
+    equity: float,
+    stop_distance: float,
+    risk_config: RiskConfig,
+    spec: SymbolSpec,
+) -> float:
+    if stop_distance <= 0 or spec.tick_size <= 0 or spec.tick_value <= 0:
+        return spec.volume_min
+    risk_amount = equity * (risk_config.risk_per_trade_pct / 100.0)
+    value_per_unit = spec.tick_value / spec.tick_size
+    loss_per_lot = stop_distance * value_per_unit
+    if loss_per_lot <= 0:
+        return spec.volume_min
+    lots = risk_amount / loss_per_lot
+    lots = math.floor(lots / spec.volume_step) * spec.volume_step
+    return round(max(spec.volume_min, min(spec.volume_max, lots)), 2)
+
+
+class BacktestSimulator:
+    """Simulates order fills, SL/TP, and equity tracking."""
+
+    def __init__(
+        self,
+        symbol: str,
+        initial_balance: float,
+        risk_config: RiskConfig,
+        spread_pips: float,
+        symbol_spec: SymbolSpec,
+    ):
+        self.symbol = symbol
+        self.balance = initial_balance
+        self.equity = initial_balance
+        self.risk_config = risk_config
+        self.spread_pips = spread_pips
+        self.spec = symbol_spec
+        self.position: Optional[SimPosition] = None
+        self.closed_trades: List[ClosedTrade] = []
+        self.equity_curve: List[Tuple[float, float]] = []
+        self._session_start_equity = initial_balance
+        self._trading_halted = False
+
+    def _pip_value(self, volume: float) -> float:
+        if self.spec.tick_size <= 0:
+            return 1.0
+        return self.spec.tick_value / self.spec.tick_size * volume
+
+    def _check_daily_loss(self) -> bool:
+        if self.risk_config.max_daily_loss_pct <= 0:
+            return True
+        loss_pct = (self._session_start_equity - self.equity) / self._session_start_equity * 100
+        if loss_pct >= self.risk_config.max_daily_loss_pct:
+            self._trading_halted = True
+            return False
+        return True
+
+    def open_position(
+        self,
+        direction: str,
+        bar: Bar,
+        bars: List[Bar],
+        bar_idx: int,
+        forecast: Dict,
+        risk_config: RiskConfig,
+    ):
+        if self._trading_halted or not self._check_daily_loss():
+            return
+
+        spread = _spread_price(self.spec, self.spread_pips)
+        if direction == "BUY":
+            entry = bar.close + spread / 2
+        else:
+            entry = bar.close - spread / 2
+
+        sl, tp, sl_dist = _compute_sl_tp_backtest(
+            direction, entry, forecast, bars, bar_idx, risk_config, self.spec,
+        )
+        volume = _calc_lot_backtest(self.equity, sl_dist, risk_config, self.spec)
+        if volume < self.spec.volume_min:
+            return
+
+        self.position = SimPosition(
+            direction=direction,
+            entry_price=entry,
+            volume=volume,
+            sl=sl,
+            tp=tp,
+            entry_time=bar.timestamp,
+            entry_bar_idx=bar_idx,
+        )
+
+    def check_exit(self, bar: Bar) -> Optional[str]:
+        if self.position is None:
+            return None
+        pos = self.position
+        if pos.direction == "BUY":
+            if bar.low <= pos.sl:
+                return "SL"
+            if bar.high >= pos.tp:
+                return "TP"
+        else:
+            if bar.high >= pos.sl:
+                return "SL"
+            if bar.low <= pos.tp:
+                return "TP"
+        return None
+
+    def _exit_price(self, bar: Bar, reason: str) -> float:
+        pos = self.position
+        spread = _spread_price(self.spec, self.spread_pips)
+        if reason == "SL":
+            raw = pos.sl
+        elif reason == "TP":
+            raw = pos.tp
+        else:
+            raw = bar.close
+        if pos.direction == "BUY":
+            return raw - spread / 2
+        return raw + spread / 2
+
+    def close_position(self, bar: Bar, reason: str):
+        if self.position is None:
+            return
+        pos = self.position
+        exit_price = self._exit_price(bar, reason)
+        price_diff = exit_price - pos.entry_price
+        if pos.direction == "SELL":
+            price_diff = -price_diff
+        pnl = price_diff * self._pip_value(pos.volume)
+        self.balance += pnl
+        self.equity = self.balance
+        self.closed_trades.append(ClosedTrade(
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            volume=pos.volume,
+            pnl=pnl,
+            entry_time=pos.entry_time,
+            exit_time=bar.timestamp,
+            exit_reason=reason,
+        ))
+        self.position = None
+
+    def update_trailing(
+        self,
+        bar: Bar,
+        bars: List[Bar],
+        bar_idx: int,
+        risk_config: RiskConfig,
+    ):
+        if self.position is None:
+            return
+        atr = _compute_atr_from_bars(bars, bar_idx, risk_config.atr_period)
+        if atr <= 0:
+            return
+        trail = atr * risk_config.trailing_atr_multiplier
+        pos = self.position
+        if pos.direction == "BUY":
+            new_sl = round(bar.close - trail, self.spec.digits)
+            if new_sl > pos.sl and new_sl < bar.close:
+                pos.sl = new_sl
+        else:
+            new_sl = round(bar.close + trail, self.spec.digits)
+            if (pos.sl == 0 or new_sl < pos.sl) and new_sl > bar.close:
+                pos.sl = new_sl
+
+    def record_equity(self, timestamp: float, mark_price: float):
+        unrealized = 0.0
+        if self.position is not None:
+            diff = mark_price - self.position.entry_price
+            if self.position.direction == "SELL":
+                diff = -diff
+            unrealized = diff * self._pip_value(self.position.volume)
+        self.equity_curve.append((timestamp, self.balance + unrealized))
+
+    def build_result(self, engine: TradingEngine) -> BacktestResult:
+        equities = [e for _, e in self.equity_curve] or [self.balance]
+        returns = np.diff(equities) / np.array(equities[:-1]) if len(equities) > 1 else []
+        peak = equities[0]
+        max_dd = 0.0
+        for eq in equities:
+            peak = max(peak, eq)
+            dd = (peak - eq) / peak * 100 if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+
+        pnls = [t.pnl for t in self.closed_trades]
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p <= 0)
+        gross_profit = sum(p for p in pnls if p > 0)
+        gross_loss = abs(sum(p for p in pnls if p < 0))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        sharpe = (
+            float(np.mean(returns) / (np.std(returns) + 1e-12) * np.sqrt(252))
+            if len(returns) > 1 else 0.0
+        )
+        ret_pct = (self.balance - self._session_start_equity) / self._session_start_equity * 100
+
+        return BacktestResult(
+            initial_balance=self._session_start_equity,
+            final_balance=self.balance,
+            total_return_pct=ret_pct,
+            total_trades=len(self.closed_trades),
+            wins=wins,
+            losses=losses,
+            win_rate=wins / len(pnls) * 100 if pnls else 0.0,
+            profit_factor=pf,
+            max_drawdown_pct=max_dd,
+            sharpe_ratio=sharpe,
+            signal_summary=engine.summary(),
+            trades=self.closed_trades,
+            equity_curve=self.equity_curve,
+        )
+
+
+def _mt5_rates_to_bars(rates) -> List[Bar]:
+    bars = []
+    for row in rates:
+        vol = float(row["real_volume"])
+        if vol == 0:
+            vol = float(row["tick_volume"])
+        bars.append(Bar(
+            timestamp=float(row["time"]),
+            open=float(row["open"]),
+            high=float(row["high"]),
+            low=float(row["low"]),
+            close=float(row["close"]),
+            volume=vol,
+        ))
+    return bars
+
+
+def print_signal_diagnostics(result: BacktestResult, confidence_threshold: float):
+    """Explain why HOLD dominated or what blocked trades."""
+    DIM = "\033[2m"
+    YELLOW = "\033[93m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+
+    print(f"  {BOLD}Signal Diagnostics{RESET}")
+    if result.confidence_stats:
+        cs = result.confidence_stats
+        print(f"    Confidence range : {cs['min']:.1%} - {cs['max']:.1%} "
+              f"(mean {cs['mean']:.1%}, median {cs['median']:.1%})")
+        print(f"    Above threshold  : {cs['above_threshold']:.1%} of bars "
+              f"(threshold {confidence_threshold:.1%})")
+    if result.hold_diagnostics:
+        hd = result.hold_diagnostics
+        total_holds = sum(hd.values())
+        if total_holds:
+            print(f"    HOLD breakdown   :")
+            labels = {
+                "low_confidence": "Low confidence (below threshold)",
+                "alert_regime": "ALERT regime (capacity spike)",
+                "neutral_direction": "Neutral forecast (move too small)",
+                "other": "Other",
+            }
+            for key, count in hd.items():
+                if count:
+                    pct = count / total_holds * 100
+                    print(f"      {labels.get(key, key):36s} {count:4d} ({pct:.0f}%)")
+    print(f"  {DIM}Tip: if 'low_confidence' dominates, lower --confidence "
+          f"(try 0.25-0.40). If 'alert_regime' dominates, market was unstable "
+          f"or raise --window for smoother capacity.{RESET}")
+    print()
+
+
+def print_backtest_report(
+    result: BacktestResult,
+    symbol: str,
+    timeframe: str,
+    confidence_threshold: float = 0.6,
+):
+    """Pretty-print backtest summary."""
+    BOLD = "\033[1m"
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
+    ret_color = GREEN if result.total_return_pct >= 0 else RED
+    print(f"\n{BOLD}{'=' * 66}{RESET}")
+    title = f"BACKTEST REPORT — {symbol} ({timeframe})"
+    if result.params:
+        p = result.params
+        title += f"  conf={p.get('confidence', confidence_threshold):.2f}"
+    print(f"  {CYAN}{BOLD}{title}{RESET}")
+    print(f"{BOLD}{'=' * 66}{RESET}")
+    print(f"  Initial balance : ${result.initial_balance:,.2f}")
+    print(f"  Final balance   : ${result.final_balance:,.2f}")
+    print(f"  Total return    : {ret_color}{result.total_return_pct:+.2f}%{RESET}")
+    print(f"  Max drawdown    : {result.max_drawdown_pct:.2f}%")
+    print(f"  Sharpe (ann.)   : {result.sharpe_ratio:.2f}")
+    print(f"  Trades          : {result.total_trades} "
+          f"({result.wins}W / {result.losses}L)")
+    print(f"  Win rate        : {result.win_rate:.1f}%")
+    print(f"  Profit factor   : {result.profit_factor:.2f}")
+    s = result.signal_summary
+    print(f"  Signals         : {s['total_signals']} total — "
+          f"BUY: {s['buys']} | SELL: {s['sells']} | HOLD: {s['holds']}")
+    print_signal_diagnostics(result, confidence_threshold)
+    print(f"{BOLD}{'=' * 66}{RESET}\n")
+
+
+def save_equity_chart(
+    result: BacktestResult,
+    path: str,
+    symbol: str,
+    timeframe: str,
+) -> bool:
+    """Save equity curve PNG. Returns False if matplotlib unavailable."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        print("[CHART] matplotlib not installed — skip chart. pip install matplotlib")
+        return False
+
+    if not result.equity_curve:
+        return False
+
+    times = [datetime.datetime.fromtimestamp(t) for t, _ in result.equity_curve]
+    equities = [e for _, e in result.equity_curve]
+
+    fig, (ax_eq, ax_dd) = plt.subplots(
+        2, 1, figsize=(11, 6), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+    )
+    fig.patch.set_facecolor("#0f1117")
+    for ax in (ax_eq, ax_dd):
+        ax.set_facecolor("#1a1d27")
+        ax.tick_params(colors="#aaa")
+        for spine in ax.spines.values():
+            spine.set_color("#333")
+
+    color = "#2ecc71" if result.total_return_pct >= 0 else "#e74c3c"
+    ax_eq.plot(times, equities, color=color, linewidth=1.8, label="Equity")
+    ax_eq.axhline(result.initial_balance, color="#666", linestyle="--",
+                  linewidth=0.8, label="Initial")
+    ax_eq.fill_between(times, result.initial_balance, equities,
+                       where=[e >= result.initial_balance for e in equities],
+                       alpha=0.15, color="#2ecc71")
+    ax_eq.fill_between(times, result.initial_balance, equities,
+                       where=[e < result.initial_balance for e in equities],
+                       alpha=0.15, color="#e74c3c")
+    ax_eq.set_ylabel("Balance ($)", color="#ccc")
+    ax_eq.set_title(
+        f"Equity Curve — {symbol} {timeframe}  "
+        f"({result.total_return_pct:+.2f}% | {result.total_trades} trades)",
+        color="#eee", fontsize=11,
+    )
+    ax_eq.legend(facecolor="#1a1d27", edgecolor="#333", labelcolor="#ccc")
+    ax_eq.grid(True, alpha=0.2, color="#444")
+
+    peak = equities[0]
+    drawdowns = []
+    for eq in equities:
+        peak = max(peak, eq)
+        drawdowns.append(-(peak - eq) / peak * 100 if peak > 0 else 0.0)
+    ax_dd.fill_between(times, 0, drawdowns, color="#e74c3c", alpha=0.5)
+    ax_dd.set_ylabel("DD %", color="#ccc")
+    ax_dd.set_xlabel("Date", color="#ccc")
+    ax_dd.grid(True, alpha=0.2, color="#444")
+    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate(rotation=20)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"[CHART] Equity curve saved -> {path}")
+    return True
+
+
+def _parse_float_list(value: str, default: List[float]) -> List[float]:
+    if not value:
+        return default
+    return [float(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def _optimizer_score(result: BacktestResult) -> float:
+    """Rank parameter combos: reward return + Sharpe, penalize drawdown / few trades."""
+    if result.total_trades < 2:
+        return -1000.0 + result.total_return_pct
+    return (
+        result.total_return_pct
+        - result.max_drawdown_pct * 0.4
+        + result.sharpe_ratio * 8.0
+        + min(result.win_rate, 80) * 0.05
+    )
+
+
+def run_optimizer_cli(
+    fc: SymplecticForecaster,
+    symbol: str,
+    tf_str: str,
+    train_bars: int,
+    test_bars: int,
+    connection: MT5Connection,
+    confidence_grid: List[float],
+    risk_grid: List[float],
+    reward_risk_grid: List[float],
+    initial_balance: float = 10000.0,
+    spread_pips: float = 1.0,
+    export_path: str = "optimize_results.csv",
+    chart_path: str = None,
+) -> Tuple[BacktestResult, pd.DataFrame]:
+    """
+    Walk-forward grid search over confidence / risk / reward-risk.
+
+    Trains once, caches test-period forecasts, then replays simulation
+    for each parameter combination.
+    """
+    tf_mt5 = TIMEFRAME_MAP[tf_str]
+    total_bars = train_bars + test_bars
+    connection.ensure_symbol(symbol)
+
+    print(f"[OPTIMIZE] Fetching {total_bars} bars of {symbol} ({tf_str}) ...")
+    rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 0, total_bars)
+    if rates is None or len(rates) < train_bars + 50:
+        raise RuntimeError("Insufficient historical data for optimization.")
+
+    all_bars = _mt5_rates_to_bars(rates)
+    train_slice = all_bars[:train_bars]
+    test_slice = all_bars[train_bars:train_bars + test_bars]
+
+    if fc._bar_count < fc.min_train_bars:
+        print(f"[OPTIMIZE] Training on {len(train_slice)} bars ...")
+        for bar in train_slice:
+            fc.process_bar(bar)
+
+    print(f"[OPTIMIZE] Caching forecasts for {len(test_slice)} test bars ...")
+    forecast_cache = fc.collect_bar_forecasts(test_slice, freeze_model=True)
+    spec = SymbolSpec.from_mt5(symbol)
+
+    combos = [
+        (conf, risk, rr)
+        for conf in confidence_grid
+        for risk in risk_grid
+        for rr in reward_risk_grid
+    ]
+    print(f"[OPTIMIZE] Sweeping {len(combos)} parameter combinations ...")
+
+    rows = []
+    best_result: Optional[BacktestResult] = None
+    best_score = -float("inf")
+
+    for conf, risk, rr in combos:
+        engine = TradingEngine(confidence_threshold=conf)
+        risk_cfg = RiskConfig(
+            risk_per_trade_pct=risk,
+            reward_risk_ratio=rr,
+        )
+        result = simulate_backtest_from_cache(
+            forecast_cache=forecast_cache,
+            bars=test_slice,
+            symbol=symbol,
+            engine=engine,
+            risk_config=risk_cfg,
+            initial_balance=initial_balance,
+            spread_pips=spread_pips,
+            symbol_spec=spec,
+        )
+        result.params = {"confidence": conf, "risk_pct": risk, "reward_risk": rr}
+        score = _optimizer_score(result)
+        rows.append({
+            "confidence": conf,
+            "risk_pct": risk,
+            "reward_risk": rr,
+            "score": round(score, 3),
+            "return_pct": round(result.total_return_pct, 3),
+            "max_dd_pct": round(result.max_drawdown_pct, 3),
+            "sharpe": round(result.sharpe_ratio, 3),
+            "trades": result.total_trades,
+            "win_rate": round(result.win_rate, 1),
+            "buys": result.signal_summary["buys"],
+            "sells": result.signal_summary["sells"],
+            "holds": result.signal_summary["holds"],
+        })
+        if score > best_score:
+            best_score = score
+            best_result = result
+
+    df = pd.DataFrame(rows).sort_values("score", ascending=False)
+    df.to_csv(export_path, index=False)
+    print(f"[OPTIMIZE] Results saved -> {export_path}")
+
+    BOLD = "\033[1m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+    print(f"\n{BOLD}{'=' * 66}{RESET}")
+    print(f"  {CYAN}{BOLD}TOP 5 PARAMETER COMBINATIONS{RESET}")
+    print(f"{BOLD}{'=' * 66}{RESET}")
+    print(f"  {'conf':>5} {'risk%':>6} {'R:R':>5} {'score':>7} "
+          f"{'ret%':>7} {'dd%':>6} {'shrp':>5} {'trds':>5}")
+    for _, row in df.head(5).iterrows():
+        print(f"  {row['confidence']:5.2f} {row['risk_pct']:6.1f} "
+              f"{row['reward_risk']:5.1f} {row['score']:7.1f} "
+              f"{row['return_pct']:+7.2f} {row['max_dd_pct']:6.1f} "
+              f"{row['sharpe']:5.2f} {int(row['trades']):5d}")
+    print(f"{BOLD}{'=' * 66}{RESET}")
+
+    if best_result:
+        print(f"\n[OPTIMIZE] Best combo:")
+        print_backtest_report(
+            best_result, symbol, tf_str,
+            confidence_threshold=best_result.params.get("confidence", 0.4),
+        )
+        if chart_path:
+            save_equity_chart(best_result, chart_path, symbol, tf_str)
+
+    return best_result, df
+
+
+def run_backtest_cli(
+    fc: SymplecticForecaster,
+    symbol: str,
+    tf_str: str,
+    train_bars: int,
+    test_bars: int,
+    engine: TradingEngine,
+    risk_config: RiskConfig,
+    connection: MT5Connection,
+    initial_balance: float = 10000.0,
+    spread_pips: float = 1.0,
+    freeze_model: bool = False,
+    export_path: str = None,
+) -> BacktestResult:
+    """Fetch data, train (or use loaded state), and run out-of-sample backtest."""
+    tf_mt5 = TIMEFRAME_MAP[tf_str]
+    total_bars = train_bars + test_bars
+
+    connection.ensure_symbol(symbol)
+    print(f"[BACKTEST] Fetching {total_bars} bars of {symbol} ({tf_str}) ...")
+    rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 0, total_bars)
+    if rates is None or len(rates) < train_bars + 50:
+        raise RuntimeError(
+            f"Insufficient data: got {len(rates) if rates is not None else 0} bars, "
+            f"need at least {train_bars + 50}."
+        )
+
+    all_bars = _mt5_rates_to_bars(rates)
+    # MT5 returns oldest-first; split train / test
+    train_slice = all_bars[:train_bars]
+    test_slice = all_bars[train_bars:train_bars + test_bars]
+
+    if fc._bar_count < fc.min_train_bars:
+        if train_bars <= 0:
+            raise RuntimeError(
+                "Model is not trained. Use --train-bars N or --load-state <file.pkl>."
+            )
+        print(f"[BACKTEST] Training on {len(train_slice)} bars ...")
+        for bar in train_slice:
+            fc.process_bar(bar)
+        print(f"[BACKTEST] Training complete. Model updates: {fc._model._n_updates}")
+    else:
+        print(f"[BACKTEST] Using trained/loaded state ({fc._model._n_updates} updates). "
+              f"Skipping training pass.")
+
+    spec = SymbolSpec.from_mt5(symbol)
+    print(f"[BACKTEST] Simulating {len(test_slice)} out-of-sample bars "
+          f"(spread={spread_pips} pips, balance=${initial_balance:,.0f}) ...")
+
+    result = fc.run_backtest(
+        symbol=symbol,
+        timeframe_str=tf_str,
+        bars=test_slice,
+        engine=engine,
+        risk_config=risk_config,
+        initial_balance=initial_balance,
+        spread_pips=spread_pips,
+        freeze_model=freeze_model,
+        symbol_spec=spec,
+    )
+
+    result.params = {
+        "confidence": engine.confidence_threshold,
+        "risk_pct": risk_config.risk_per_trade_pct,
+        "reward_risk": risk_config.reward_risk_ratio,
+    }
+    print_backtest_report(result, symbol, tf_str, engine.confidence_threshold)
+
+    chart_path = export_path.replace(".csv", "_equity.png") if export_path else None
+    if chart_path:
+        save_equity_chart(result, chart_path, symbol, tf_str)
+
+    if export_path:
+        rows = []
+        for t in result.trades:
+            rows.append({
+                "direction": t.direction,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "volume": t.volume,
+                "pnl": t.pnl,
+                "entry_time": datetime.datetime.fromtimestamp(t.entry_time),
+                "exit_time": datetime.datetime.fromtimestamp(t.exit_time),
+                "exit_reason": t.exit_reason,
+            })
+        pd.DataFrame(rows).to_csv(export_path, index=False)
+        print(f"[BACKTEST] Trade log saved -> {export_path}")
+
+    return result
 
 
 # ===========================================================================
@@ -1567,20 +3143,73 @@ Examples:
                         help="MT5 broker server (optional)")
     parser.add_argument("--mt5-path", type=str, default=None,
                         help="Path to terminal64.exe (optional, auto-detected)")
-    parser.add_argument("--confidence", type=float, default=0.6,
-                        help="Confidence threshold for BUY/SELL signals (default: 0.6)")
+    parser.add_argument("--confidence", type=float, default=0.4,
+                        help="Confidence threshold for BUY/SELL signals (default: 0.4)")
+    parser.add_argument("--optimize", action="store_true",
+                        help="Grid-search confidence/risk/R:R on backtest data")
+    parser.add_argument("--opt-confidence", type=str, default="0.2,0.3,0.4,0.5,0.6",
+                        help="Comma-separated confidence values for optimizer")
+    parser.add_argument("--opt-risk", type=str, default="0.5,1.0,1.5",
+                        help="Comma-separated risk %% values for optimizer")
+    parser.add_argument("--opt-reward-risk", type=str, default="1.5,2.0,2.5",
+                        help="Comma-separated R:R values for optimizer")
     parser.add_argument("--window", type=int, default=60,
                         help="Symplectic rolling window size (default: 60)")
     parser.add_argument("--poll", type=float, default=0.0,
                         help="Custom poll interval in seconds (0 = auto)")
+    parser.add_argument("--auto-trade", action="store_true",
+                        help="Enable automatic order execution (demo by default)")
+    parser.add_argument("--allow-live", action="store_true",
+                        help="Allow trading on live accounts (requires --auto-trade)")
+    parser.add_argument("--risk-pct", type=float, default=1.0,
+                        help="Risk per trade as %% of equity (default: 1.0)")
+    parser.add_argument("--max-daily-loss", type=float, default=3.0,
+                        help="Max daily loss %% before halting (default: 3.0)")
+    parser.add_argument("--reward-risk", type=float, default=2.0,
+                        help="Take-profit / stop-loss ratio (default: 2.0)")
+    parser.add_argument("--atr-sl", type=float, default=1.5,
+                        help="ATR multiplier for stop-loss (default: 1.5)")
+    parser.add_argument("--trailing-atr", type=float, default=1.0,
+                        help="ATR multiplier for trailing stop (default: 1.0)")
+    parser.add_argument("--max-positions", type=int, default=1,
+                        help="Max concurrent positions per symbol (default: 1)")
+    parser.add_argument("--backtest", action="store_true",
+                        help="Run out-of-sample backtest instead of live monitoring")
+    parser.add_argument("--train-bars", type=int, default=1000,
+                        help="Training bars for backtest (default: 1000)")
+    parser.add_argument("--test-bars", type=int, default=500,
+                        help="Out-of-sample bars for backtest (default: 500)")
+    parser.add_argument("--initial-balance", type=float, default=10000.0,
+                        help="Starting balance for backtest (default: 10000)")
+    parser.add_argument("--spread-pips", type=float, default=1.0,
+                        help="Simulated spread in pips for backtest (default: 1.0)")
+    parser.add_argument("--freeze-model", action="store_true",
+                        help="Do not update model during backtest test period")
+    parser.add_argument("--state-dir", type=str, default="states",
+                        help="Directory for saved model state files (default: states)")
+    parser.add_argument("--load-state", type=str, default=None,
+                        help="Load model state from pickle file (skips training)")
+    parser.add_argument("--no-save-state", action="store_true",
+                        help="Disable auto-save of model state on exit")
     args = parser.parse_args()
 
     # ── Banner ──
     CYAN = "\033[96m"; BOLD = "\033[1m"; RESET = "\033[0m"; DIM = "\033[2m"
+    if args.optimize:
+        mode_str = "Walk-Forward Optimizer"
+    elif args.backtest:
+        mode_str = "Backtest"
+    elif args.auto_trade:
+        mode_str = "Auto-Trade"
+    else:
+        mode_str = "Signal-Only (no auto-execution)"
     print(f"\n{BOLD}{'=' * 66}{RESET}")
     print(f"  {CYAN}{BOLD}SYMPLECTIC ML PRICE FORECASTER — MetaTrader 5{RESET}")
     print(f"  {DIM}Based on: Mishra (2026) · Shultz (2023) · Mantegna (1999){RESET}")
-    print(f"  {DIM}Mode: Signal-Only (no auto-execution){RESET}")
+    print(f"  {DIM}Mode: {mode_str}{RESET}")
+    if args.auto_trade:
+        print(f"  {DIM}Risk: {args.risk_pct}%/trade | Max daily loss: {args.max_daily_loss}% | "
+              f"R:R = 1:{args.reward_risk}{RESET}")
     print(f"{BOLD}{'=' * 66}{RESET}\n")
 
     # ── Step 1: Connect to MT5 ──
@@ -1601,16 +3230,22 @@ Examples:
         print(f"\n[ERROR] {e}")
         sys.exit(1)
 
-    # Initialize and start Dashboard Server
-    global_dashboard_state = DashboardState()
-    srv_thread = threading.Thread(
-        target=start_dashboard_server,
-        args=(global_dashboard_state, 8080, os.path.join(os.path.dirname(__file__), "dashboard.html")),
-        daemon=True
-    )
-    srv_thread.start()
+    global_dashboard_state = None
+    if not args.backtest and not args.optimize:
+        global_dashboard_state = DashboardState()
+        srv_thread = threading.Thread(
+            target=start_dashboard_server,
+            args=(global_dashboard_state, 8080,
+                  os.path.join(os.path.dirname(__file__), "dashboard.html")),
+            daemon=True
+        )
+        srv_thread.start()
 
-    engine = None  # declare for finally block
+    engine = None
+    fc = None
+    symbol = None
+    tf_str = None
+    state_loaded = False
 
     try:
         # ── Step 2: Get symbol (interactive or CLI) ──
@@ -1653,54 +3288,138 @@ Examples:
             alert_pct=0.95,
             min_train_bars=80,
         )
-        engine = TradingEngine(confidence_threshold=args.confidence)
+        tf_mt5 = TIMEFRAME_MAP[tf_str]
+        if args.auto_trade:
+            risk_cfg = RiskConfig(
+                risk_per_trade_pct=args.risk_pct,
+                max_daily_loss_pct=args.max_daily_loss,
+                reward_risk_ratio=args.reward_risk,
+                atr_sl_multiplier=args.atr_sl,
+                trailing_atr_multiplier=args.trailing_atr,
+                max_positions=args.max_positions,
+                allow_live=args.allow_live,
+            )
+            executor = MT5TradeExecutor(risk_cfg, connection=conn)
+            engine = AutoTradingEngine(
+                executor, confidence_threshold=args.confidence, timeframe=tf_mt5,
+            )
+        else:
+            engine = TradingEngine(confidence_threshold=args.confidence)
 
-        # ── Step 5: Train on MT5 historical data ──
-        print()
-        rdf = fc.train_on_mt5(symbol, tf_str, args.bars, connection=conn)
-
-        # ── Step 6: Print initial forecast / signal ──
-        result = fc.forecast(horizon=5)
-        if "error" not in result:
-            # Merge into a format the trading engine expects
-            initial_forecast = {
-                **result,
-                "close": result["current_price"],
-                "alert": result["regime"] == "ALERT",
-                "capacity": result["current_capacity"],
-                "betti_1": result["current_betti_1"],
-            }
-            
-            if global_dashboard_state:
-                pts = np.array(list(fc._phase_buf), dtype=float)
-                hull_verts = get_convex_hull_vertices(pts)
-                acc_info = conn.get_account_info() if conn else {}
-                global_dashboard_state.update_live_metrics(
-                    symbol=symbol,
-                    timeframe=tf_str,
-                    latest_forecast=initial_forecast,
-                    phase_buf=list(fc._phase_buf),
-                    hull_points=hull_verts.tolist(),
-                    acc_info=acc_info,
-                    total_updates=fc._model._n_updates
-                )
-                
-            engine.on_signal(initial_forecast, symbol)
-
-        # ── Step 7: Export training results ──
-        export_path = f"symplectic_{symbol}_{tf_str}.csv"
-        fc.export_results(rdf, export_path)
-
-        # ── Step 8: Start live monitoring ──
-        print(f"\n{BOLD}[INFO] Starting live monitoring...{RESET}")
-        print(f"{DIM}       The model continues learning from each new bar.{RESET}")
-        poll = args.poll if args.poll > 0 else 0.0
-        fc.run_live_mt5(
-            symbol, tf_str,
-            poll_interval=poll,
-            on_signal=engine.on_signal,
-            connection=conn,
+        risk_cfg = RiskConfig(
+            risk_per_trade_pct=args.risk_pct,
+            max_daily_loss_pct=args.max_daily_loss,
+            reward_risk_ratio=args.reward_risk,
+            atr_sl_multiplier=args.atr_sl,
+            trailing_atr_multiplier=args.trailing_atr,
+            max_positions=args.max_positions,
+            allow_live=args.allow_live,
         )
+
+        # ── Step 5: Load saved state or train ──
+        state_path = args.load_state
+        if state_path is None and not args.no_save_state and not args.backtest:
+            state_path = str(SymplecticForecaster.default_state_path(
+                symbol, tf_str, args.state_dir))
+
+        if args.load_state:
+            fc.load_state(args.load_state, symbol=symbol, timeframe=tf_str)
+            state_loaded = True
+        elif (state_path and Path(state_path).exists()
+              and not args.backtest and not args.load_state):
+            try:
+                fc.load_state(state_path, symbol=symbol, timeframe=tf_str)
+                state_loaded = True
+            except (ValueError, FileNotFoundError) as e:
+                print(f"[STATE] Could not load existing state: {e}")
+                print(f"[STATE] Will train from scratch.")
+
+        if args.backtest or args.optimize:
+            if args.optimize:
+                run_optimizer_cli(
+                    fc=fc,
+                    symbol=symbol,
+                    tf_str=tf_str,
+                    train_bars=args.train_bars if not state_loaded else 0,
+                    test_bars=args.test_bars,
+                    connection=conn,
+                    confidence_grid=_parse_float_list(
+                        args.opt_confidence, [0.2, 0.3, 0.4, 0.5, 0.6]),
+                    risk_grid=_parse_float_list(args.opt_risk, [0.5, 1.0, 1.5]),
+                    reward_risk_grid=_parse_float_list(
+                        args.opt_reward_risk, [1.5, 2.0, 2.5]),
+                    initial_balance=args.initial_balance,
+                    spread_pips=args.spread_pips,
+                    export_path=f"optimize_{symbol}_{tf_str}.csv",
+                    chart_path=f"optimize_{symbol}_{tf_str}_equity.png",
+                )
+            else:
+                run_backtest_cli(
+                    fc=fc,
+                    symbol=symbol,
+                    tf_str=tf_str,
+                    train_bars=args.train_bars if not state_loaded else 0,
+                    test_bars=args.test_bars,
+                    engine=engine,
+                    risk_config=risk_cfg,
+                    connection=conn,
+                    initial_balance=args.initial_balance,
+                    spread_pips=args.spread_pips,
+                    freeze_model=args.freeze_model,
+                    export_path=f"backtest_{symbol}_{tf_str}.csv",
+                )
+            if not args.no_save_state:
+                save_path = str(SymplecticForecaster.default_state_path(
+                    symbol, tf_str, args.state_dir))
+                fc.save_state(save_path, symbol, tf_str)
+        else:
+            if not state_loaded:
+                print()
+                rdf = fc.train_on_mt5(symbol, tf_str, args.bars, connection=conn)
+                export_path = f"symplectic_{symbol}_{tf_str}.csv"
+                fc.export_results(rdf, export_path)
+            else:
+                print(f"[INFO] Resuming from saved state — skipping historical training.")
+
+            # ── Step 6: Print initial forecast / signal ──
+            result = fc.forecast(horizon=5)
+            if "error" not in result:
+                initial_forecast = {
+                    **result,
+                    "close": result["current_price"],
+                    "alert": result["regime"] == "ALERT",
+                    "capacity": result["current_capacity"],
+                    "betti_1": result["current_betti_1"],
+                }
+
+                if global_dashboard_state:
+                    pts = np.array(list(fc._phase_buf), dtype=float)
+                    hull_verts = get_convex_hull_vertices(pts)
+                    acc_info = conn.get_account_info() if conn else {}
+                    global_dashboard_state.update_live_metrics(
+                        symbol=symbol,
+                        timeframe=tf_str,
+                        latest_forecast=initial_forecast,
+                        phase_buf=list(fc._phase_buf),
+                        hull_points=hull_verts.tolist(),
+                        acc_info=acc_info,
+                        total_updates=fc._model._n_updates
+                    )
+
+                engine.on_signal(initial_forecast, symbol)
+
+            # ── Step 8: Start live monitoring ──
+            print(f"\n{BOLD}[INFO] Starting live monitoring...{RESET}")
+            print(f"{DIM}       The model continues learning from each new bar.{RESET}")
+            poll = args.poll if args.poll > 0 else 0.0
+            on_poll = engine.on_poll if args.auto_trade else None
+            fc.run_live_mt5(
+                symbol, tf_str,
+                poll_interval=poll,
+                on_signal=engine.on_signal,
+                on_poll=on_poll,
+                connection=conn,
+            )
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
@@ -1709,13 +3428,39 @@ Examples:
         import traceback
         traceback.print_exc()
     finally:
-        # Print signal summary
-        if engine is not None:
-            s = engine.summary()
-            print(f"\n  {BOLD}Signal Summary:{RESET} {s['total_signals']} total — "
-                  f"\033[92mBUY: {s['buys']}\033[0m | "
-                  f"\033[91mSELL: {s['sells']}\033[0m | "
-                  f"\033[93mHOLD: {s['holds']}\033[0m")
+        if not args.backtest and not args.optimize and fc is not None and symbol and tf_str:
+            if not args.no_save_state:
+                save_path = args.load_state or str(
+                    SymplecticForecaster.default_state_path(
+                        symbol, tf_str, args.state_dir))
+                try:
+                    fc.save_state(save_path, symbol, tf_str)
+                except Exception as e:
+                    print(f"[STATE] Auto-save failed: {e}")
+
+        if engine is not None and not args.backtest and not args.optimize:
+            if args.auto_trade and isinstance(engine, AutoTradingEngine):
+                summary = engine.trade_summary()
+                s = summary["signals"]
+                t = summary["trades"]
+                print(f"\n  {BOLD}Signal Summary:{RESET} {s['total_signals']} total — "
+                      f"\033[92mBUY: {s['buys']}\033[0m | "
+                      f"\033[91mSELL: {s['sells']}\033[0m | "
+                      f"\033[93mHOLD: {s['holds']}\033[0m")
+                print(f"  {BOLD}Trade Summary:{RESET} "
+                      f"Opened: {t['OPEN']} | Closed: {t['CLOSE']} | "
+                      f"Modified: {t['MODIFY']} | Skipped: {t['SKIP']} | "
+                      f"Errors: {t['ERROR']}")
+            else:
+                s = engine.summary()
+                print(f"\n  {BOLD}Signal Summary:{RESET} {s['total_signals']} total — "
+                      f"\033[92mBUY: {s['buys']}\033[0m | "
+                      f"\033[91mSELL: {s['sells']}\033[0m | "
+                      f"\033[93mHOLD: {s['holds']}\033[0m")
+
         conn.disconnect()
-        print(f"\n{BOLD}[DONE]{RESET} The model state is discarded. "
-              f"Restart to begin a new session.")
+        if args.no_save_state:
+            print(f"\n{BOLD}[DONE]{RESET} Session ended (state not saved).")
+        else:
+            print(f"\n{BOLD}[DONE]{RESET} Session ended. Model state preserved in "
+                  f"'{args.state_dir}/'.")
