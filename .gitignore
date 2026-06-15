@@ -29,6 +29,12 @@ Desktop.ini
 
 # Project outputs
 symplectic_*.csv
+backtest_*.csv
+backtest_*_equity.png
+optimize_*.csv
+optimize_*_equity.png
+states/
+*.pkl
 *.log
 
 # Secrets (never commit credentials)
