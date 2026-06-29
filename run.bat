@@ -4,7 +4,7 @@ REM  Symplectic Forecaster — MetaTrader 5 Launcher
 REM  Uses Python 3.11 (required for MetaTrader5 package)
 REM ============================================================
 
-set PYTHON=C:\Users\himal\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\python.exe
+set PYTHON=python
 
 REM Check Python exists
 if not exist "%PYTHON%" (

@@ -1,410 +1,97 @@
-# Symplectic ML Forecaster — MetaTrader 5
+# Symplectic Forecaster MT5 (Version 2.0)
 
-<div align="center">
+A high-frequency algorithmic trading system designed exclusively for MetaTrader 5, utilizing a state-of-the-art Deep Learning and Reinforcement Learning microservice architecture.
 
-**A self-learning price forecaster with continuous trade feedback, built on symplectic phase-space geometry and topological data analysis, connected directly to MetaTrader 5.**
+## What is this?
 
-[![Python 3.11](https://img.shields.io/badge/Python-3.8--3.13-3776AB?logo=python&logoColor=white)](https://python.org)
-[![MetaTrader 5](https://img.shields.io/badge/MetaTrader_5-Live_Data-blue?logo=metatrader5)](https://www.metatrader5.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+Symplectic Forecaster is an advanced autonomous algorithmic trading bot. It bridges the gap between high-frequency quantitative finance and cutting-edge machine learning. Unlike traditional technical indicator-based bots, it views the financial markets as a complex dynamical system. It tracks the "phase space" (momentum and position) of price movements and uses deep neural networks to forecast the probabilistic trajectory of future prices. Version 2.0 represents a complete architectural overhaul, decoupling trade execution from heavy artificial intelligence computation to ensure zero-latency order routing.
 
-</div>
+## What is it based on?
 
----
+This system synthesizes research from several domains of quantitative finance and topology:
+* **Hamiltonian Mechanics & Symplectic Geometry (Mishra, 2026):** Models financial markets as physical systems conserving momentum, mapping price action into a 2D phase-space matrix.
+* **Topological Data Analysis (TDA) (Shultz, 2023):** Tracks the shape and persistence of price clusters, computing Betti numbers to measure market fragmentation and consolidation.
+* **Econophysics (Mantegna, 1999):** Views market microstructure as a stochastic process, capturing complex dynamics using convex hulls and structural regime alerts.
 
-## Overview
+## Concepts and Tools Used
 
-This project implements an **online machine learning forecaster** that ingests live market data from **MetaTrader 5** and produces **BUY / SELL / HOLD** trading signals. Unlike conventional technical-analysis tools, it models price action as a trajectory through a **symplectic phase space**, extracts topological features via **persistent homology**, and learns incrementally — bar by bar — so it adapts to regime changes in real time.
+* **PyTorch (Deep Sequence Modeling):** Employs a custom Long Short-Term Memory (LSTM) network to model multi-horizon temporal dependencies, generating robust forecasts across multiple future bars.
+* **StableBaselines3 (Reinforcement Learning):** Utilizes Proximal Policy Optimization (PPO) in a custom Gymnasium environment. It learns optimal trading policies and uses Inverse Propensity Scoring to learn from counterfactual scenarios (e.g., automatically adjusting weights when a Stop Loss is hit).
+* **DoWhy (Causal Inference):** Integrates Microsoft's DoWhy framework for Invariant Causal Prediction. It dynamically prunes non-causal features that flip correlations during structural regime changes.
+* **Optuna (Bayesian Optimization):** Runs continuous, non-blocking background hyperparameter studies to mathematically dial in the optimal Regularization (C) and Grace Periods.
+* **MetaTrader 5 (MT5) Integration:** Directly interfaces with the MT5 terminal via the official `MetaTrader5` Python library for sub-millisecond execution.
 
-The model also **learns from every trade it takes**: when a position closes, the realized profit/loss is fed back into the ML model to reinforce winning patterns and penalize losing ones, creating a continuous improvement loop.
+## Features
 
-> **Signal-only by default** — add `--auto-trade` to enable automatic order execution with risk management. Live accounts require `--allow-live`.
+* **Microservice Architecture:** Utilizes native Python multiprocessing to run the Execution Engine, AI Engine, and Causal Optimizer on separate threads. The MT5 execution thread never blocks.
+* **True Multi-Horizon Loss:** The PyTorch model optimizes across three forward trajectories simultaneously to maximize trade holding stability.
+* **Counterfactual Offline RL:** When a trade fails (hits a Stop Loss), the system mathematically penalizes its own blindspots and routes an Inverse Propensity Score back into the neural network to permanently correct the policy.
+* **Live Portfolio Dashboard:** Features an embedded asynchronous web dashboard for monitoring live PnL, feature attribution, and predicted regime transition probabilities.
+* **Adaptive Risk Management:** Automatically trails Stop Losses based on real-time Average True Range (ATR) volatility scaling.
 
----
+## Options Available
 
-## Key Features
+The system supports a wide array of command-line configurations:
 
-| Feature | Description |
-|---|---|
-| **Continuous Trade Learning** | Model learns from every closed trade — feeds realized P&L back to update weights in real-time. |
-| **Overfitting Protection** | L2 regularization + learning rate decay prevent the model from overreacting to individual trades. |
-| **Portfolio Dashboard** | Professional portfolio analysis dashboard with equity curve, win rate, profit factor, drawdown, streaks, and full trade log. |
-| **Symplectic Phase Space** | Maps price and volume to canonical coordinates `(q, p)` on a symplectic manifold. Convex hull area = first ECH capacity `C(t)`. |
-| **Topological Data Analysis** | Persistent homology (H₀, H₁) on the rolling phase-space point cloud detects market cycles and structural breaks. |
-| **Self-Learning Model** | Online ensemble (Passive-Aggressive Regressor + Hoeffding Adaptive Tree) updates after every bar — no batch retraining needed. |
-| **Regime Detection** | Capacity spikes above the 95th percentile trigger an ALERT regime — the model avoids trading during phase-space bifurcations. |
-| **Multi-Step Scenarios** | Generates bull / base / bear price paths with symplectic stability bounds (Lipschitz uncertainty bands). |
-| **Any Symbol, Any Timeframe** | Works with any MT5 instrument — forex, indices, commodities, crypto — on any timeframe from M1 to MN1. |
-| **Zero External Data Files** | All data comes directly from your MT5 broker. No CSVs, no API keys, no Yahoo Finance. |
-| **Auto-Trade Mode** | Optional execution with % risk sizing, symplectic/ATR stop-loss, R:R take-profit, trailing stops, and daily loss limits. |
+### Trading Modes
+* `--auto-trade`: Enables live autonomous order execution. If omitted, the bot runs in signal-only mode.
+* `--allow-live`: Safety switch required to execute trades on a Live (Real money) account rather than a Demo account.
 
----
+### Risk Parameters
+* `--risk-pct`: Percentage of account balance to risk per trade (Default: 1.0).
+* `--reward-risk`: Target Reward-to-Risk ratio (Default: 1.5).
+* `--max-daily-loss`: Hard cap on daily portfolio drawdown percentage before the bot shuts down (Default: 3.0).
+* `--atr-sl`: Multiplier for initial Stop Loss based on ATR (Default: 2.0).
 
-## How Continuous Learning Works
-
-The model improves itself through two feedback loops:
-
-### 1. Bar-by-Bar Learning (Market Structure)
-After every new bar, the model compares its previous prediction against the actual price movement and updates its weights. This teaches it the general structure of the market.
-
-### 2. Trade Outcome Learning (Direct Feedback)
-When a trade closes (hit TP or SL), the model:
-1. Retrieves the exact feature snapshot it used when opening the trade
-2. Calculates the realized percentage return
-3. Feeds this back into the model via `learn_one(features, realized_return)`
-4. The model adjusts to encourage patterns that led to wins and avoid patterns that led to losses
-
-### Overfitting Protection
-To prevent the model from overreacting to a single bad trade:
-- **L2 Regularization** — constrains weight magnitudes, ensuring smooth generalization
-- **Learning Rate Decay** — the model adapts less aggressively over time (`invscaling` schedule)
-- **Low C Parameter** — the Passive-Aggressive regressor uses `C=0.005` to limit per-sample influence
-
-> **Memory requirements:** The continuous learning system uses only a few MB of RAM. Even 100,000+ trades would consume less than 500 MB of disk storage.
-
----
-
-## Live Portfolio Dashboard
-
-Every time the forecaster is running, a local web server starts up automatically in the background.
-
-- **URL**: [http://localhost:8080](http://localhost:8080)
-- **Features**:
-  - **KPI Strip**: Balance, Total Return, Win Rate, Profit Factor, Max Drawdown, Total Trades
-  - **Performance Stats**: Avg Win/Loss, Best/Worst Trade, Win/Loss Streaks, Expectancy
-  - **Win/Loss Donut Chart**: Visual win rate breakdown
-  - **Equity Curve**: Cumulative % return across all closed trades
-  - **Price Action Chart**: Live price with real-time updates
-  - **Direction Accuracy**: Rolling 30-bar forecast accuracy
-  - **Trade Log Table**: Full history with Ticket, Action, Volume, Entry, SL, TP, and Return %
-  - **Auto-refresh**: Updates every 2 seconds without page reload
-
----
-
-## Mathematical Foundations
-
-The forecaster rests on four pillars:
-
-### 1. Financial Phase Space
-
-Based on [Mishra (2026)](https://doi.org/10.xxxx) — models price dynamics as a Hamiltonian system:
-
-```
-Position:  q(t) = ln P(t)                   [log-price]
-Momentum:  p(t) = V(t) · sign(ΔP(t))        [signed order-flow]
-Capacity:  C(t) = Area(ConvexHull(Dₜ))       [symplectic area]
-```
-
-**Stability guarantee** (Lemma 3.1): `|C(t) − C(t′)| ≤ L·δ + π·δ²` bounds capacity variation under Hausdorff perturbation `δ`.
-
-### 2. Persistent Homology (TDA)
-
-Following [Shultz (2023)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4378151):
-
-- **H₀ features** — connected-component lifetimes (market fragmentation)
-- **H₁ features** — loop persistence (cyclicity detection)
-
-### 3. Hierarchical Market Structure
-
-Per [Mantegna (1999)](https://link.springer.com/article/10.1007/s100510050929):
-
-- Cross-asset correlation distance `d(i,j) = √(2(1 − ρᵢⱼ))`
-
-### 4. Symplectic Capacities
-
-Following [Cieliebak et al. (2005)](https://arxiv.org/abs/math/0506191):
-
-- Gromov width `c₁(X_Ω) = Area(Ω)` for convex toric domains
-- Capacity-preserving structure as a conservation law
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     MetaTrader 5 Terminal                       │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ copy_rates / symbol_info_tick
-                           ▼
-              ┌─────────────────────────┐
-              │     MT5Connection       │
-              │  connect · ensure_symbol│
-              └────────────┬────────────┘
-                           │ Bar(OHLCV)
-                           ▼
-              ┌─────────────────────────┐
-              │  SymplecticForecaster   │
-              │                         │
-              │  ┌───────────────────┐  │
-              │  │ Phase Coordinates │  │  q = ln P,  p = V·sign(ΔP)
-              │  └────────┬──────────┘  │
-              │           │             │
-              │  ┌────────▼──────────┐  │
-              │  │ Convex Hull       │  │  C(t) = Area,  L(t) = Perimeter
-              │  │ + TDA (Ripser)    │  │  Betti-0, Betti-1, persistence
-              │  └────────┬──────────┘  │
-              │           │             │
-              │  ┌────────▼──────────┐  │
-              │  │ Online ML Model   │  │  PA Regressor + Hoeffding Tree
-              │  │ (self-learning)   │  │  Updates every bar + trade close
-              │  └────────┬──────────┘  │
-              │           │             │
-              │  ┌────────▼──────────┐  │
-              │  │ Scenario Generator│  │  Bull / Base / Bear paths
-              │  │ + Stability Bands │  │  Lipschitz uncertainty envelope
-              │  └────────┬──────────┘  │
-              └───────────┼─────────────┘
-                          │ forecast dict
-                          ▼
-              ┌─────────────────────────┐
-              │ AutoTradingEngine       │
-              │  BUY  ▲  confidence > θ │──┐
-              │  SELL ▼  confidence > θ │  │ on close: learn_one(features, pnl)
-              │  HOLD ━  low conf/ALERT │──┘
-              └─────────────────────────┘
-```
-
----
+### Filters
+* `--news-filter`: Suspends trading during high-impact macroeconomic news releases.
+* `--time-filter`: Restricts trading to high-liquidity market hours (Avoids 00:00-06:00 UTC).
 
 ## Installation
 
 ### Prerequisites
+* Windows OS (Required by MetaTrader 5).
+* Python 3.10 or 3.11 (Python 3.12+ may not support the MT5 library).
+* MetaTrader 5 Terminal installed and running.
+* (Optional but Recommended) A CUDA-enabled NVIDIA GPU for PyTorch acceleration.
 
-- **Windows** (MetaTrader 5 is Windows-only)
-- **Python 3.8 – 3.13** (MT5 package does **not** support Python 3.14+)
-- **MetaTrader 5 terminal** installed and logged in (demo or live account)
+### Setup Steps
+1. Clone the repository and checkout Version 2.0:
+   ```bash
+   git clone https://github.com/himalay00125-boop/symplectic-forecaster-mt5.git
+   cd symplectic-forecaster-mt5
+   git checkout version-2.0
+   ```
+2. Install the necessary heavyweight AI dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-### Setup
+## How to Run
 
+1. Open your MetaTrader 5 terminal and ensure you are logged into your broker.
+2. In MT5, go to **Tools -> Options -> Expert Advisors** and enable "Allow algorithmic trading".
+3. Open your command prompt (or PowerShell) in the project directory.
+
+### Example Commands
+
+**Run in Signal-Only Mode (Safest):**
 ```bash
-# Clone the repository
-git clone https://github.com/himalay00125-boop/symplectic-forecaster-mt5.git
-cd symplectic-forecaster-mt5
-
-# Install dependencies
-pip install -r requirements.txt
+python symplectic_forecaster.py --symbol EURUSD --timeframe M15
 ```
 
-### Optional (enhanced features)
-
+**Run with Live Auto-Trading (Demo Account):**
 ```bash
-# Ripser for exact TDA (persistent homology)
-pip install ripser
-
-# River for online ML ensemble (PA Regressor + Hoeffding Tree)
-pip install river
+python symplectic_forecaster.py --symbol EURUSD --timeframe M15 --auto-trade --risk-pct 1.0 --reward-risk 2.0
 ```
 
-> Without `ripser`, TDA features are approximated. Without `river`, the model falls back to sklearn's SGDRegressor with L2 regularization.
-
----
-
-## Usage
-
-### Quick Start
-
-Make sure your **MetaTrader 5 terminal is running** and logged in, then:
-
+**Run on Multiple Symbols:**
 ```bash
-# Interactive mode — prompts for symbol and timeframe
-python symplectic_forecaster.py
-
-# Or use the launcher (auto-selects correct Python version)
-run.bat
+python symplectic_forecaster.py --symbols "EURUSD,GBPUSD,XAUUSD" --timeframe H1 --auto-trade
 ```
 
-### Command-Line Arguments
-
-```bash
-# Specify symbol and timeframe directly
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1
-
-# Gold on daily chart with 2000 bars of history
-python symplectic_forecaster.py --symbol XAUUSD --timeframe D1 --bars 2000
-
-# Auto-trade on demo account (1% risk/trade, 3% max daily loss)
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --auto-trade
-
-# Auto-trade with custom risk settings
-python symplectic_forecaster.py --symbol XAUUSD --timeframe H4 --auto-trade \
-    --risk-pct 0.5 --max-daily-loss 2.0 --reward-risk 2.5 --trailing-atr 1.2
-
-# With explicit MT5 login
-python symplectic_forecaster.py --symbol US500 --timeframe H4 \
-    --account 12345678 --password mypass --server "BrokerDemo-Server"
-```
-
-### All Options
-
-| Argument | Default | Description |
-|---|---|---|
-| `--symbol` | *(interactive)* | MT5 symbol (e.g., `EURUSD`, `XAUUSD`, `US500`, `BTCUSD`) |
-| `--timeframe` | *(interactive)* | Timeframe: `M1` `M5` `M15` `M30` `H1` `H4` `H12` `D1` `W1` `MN1` |
-| `--bars` | `1000` | Number of historical bars for initial training |
-| `--confidence` | `0.4` | Minimum confidence for BUY/SELL signals (0.0 – 1.0) |
-| `--optimize` | `false` | Grid-search confidence / risk / R:R on backtest data |
-| `--opt-confidence` | `0.2,0.3,0.4,0.5,0.6` | Optimizer confidence grid |
-| `--opt-risk` | `0.5,1.0,1.5` | Optimizer risk % grid |
-| `--opt-reward-risk` | `1.5,2.0,2.5` | Optimizer R:R grid |
-| `--window` | `60` | Rolling window size for symplectic phase space |
-| `--poll` | *(auto)* | Poll interval in seconds (0 = auto-detect from timeframe) |
-| `--auto-trade` | `false` | Enable automatic order execution |
-| `--allow-live` | `false` | Allow trading on live (non-demo) accounts |
-| `--risk-pct` | `1.0` | Risk per trade as % of equity |
-| `--max-daily-loss` | `3.0` | Halt trading if daily loss exceeds this % |
-| `--reward-risk` | `2.0` | Take-profit / stop-loss ratio |
-| `--atr-sl` | `1.5` | ATR multiplier for stop-loss distance |
-| `--trailing-atr` | `1.0` | ATR multiplier for trailing stop distance |
-| `--max-positions` | `1` | Max concurrent positions per symbol |
-| `--backtest` | `false` | Run out-of-sample backtest instead of live |
-| `--train-bars` | `1000` | Training bars for backtest |
-| `--test-bars` | `500` | Out-of-sample bars for backtest |
-| `--initial-balance` | `10000` | Starting balance for backtest |
-| `--spread-pips` | `1.0` | Simulated spread in pips |
-| `--freeze-model` | `false` | Don't update model during backtest test period |
-| `--state-dir` | `states` | Directory for model state files |
-| `--load-state` | *(none)* | Load model state from pickle file |
-| `--no-save-state` | `false` | Disable auto-save on exit |
-| `--account` | *(none)* | MT5 account number (optional if terminal is logged in) |
-| `--password` | *(none)* | MT5 password (optional) |
-| `--server` | *(none)* | MT5 server name (optional) |
-| `--mt5-path` | *(auto)* | Path to `terminal64.exe` (optional, auto-detected) |
-
----
-
-## Signal Logic
-
-The trading engine generates signals based on three factors:
-
-| Signal | Condition |
-|---|---|
-| **▲ BUY** | `direction = +1` AND `confidence > threshold` AND `regime ≠ ALERT` |
-| **▼ SELL** | `direction = -1` AND `confidence > threshold` AND `regime ≠ ALERT` |
-| **━ HOLD** | `confidence < threshold` OR `regime = ALERT` |
-
----
-
-## Auto-Trade Mode
-
-Enable with `--auto-trade`. The bot executes signals through MT5 with built-in risk controls:
-
-| Control | Behavior |
-|---|---|
-| **Position sizing** | Lot size computed from `% equity at risk` and stop distance |
-| **Stop-loss** | Symplectic stability bands when available; falls back to ATR |
-| **Take-profit** | Set at `reward_risk` × stop distance (default 1:2 R:R) |
-| **Trailing stop** | ATR-based trail updated every poll cycle on open positions |
-| **Daily loss limit** | Trading halts if equity drops by `max_daily_loss` % in a session |
-| **Trade learning** | On every close, realized P&L is fed back into the model |
-| **Live safety** | Demo accounts trade freely; live accounts require `--allow-live` |
-
-### Recommended Demo Workflow
-
-1. Open MT5 and log into a **demo** account
-2. Run: `python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --auto-trade`
-3. Watch the console for `[TRADE]` messages and the dashboard at `http://localhost:8080`
-4. Look for `[Learned Feedback]` in the console — confirms the model learned from a closed trade
-5. Only add `--allow-live` after extensive demo testing
-
----
-
-## Model State Persistence
-
-The forecaster saves its learned weights and rolling buffers to disk so restarts don't wipe progress.
-
-| Behavior | Description |
-|---|---|
-| **Auto-save** | On exit, state is saved to `states/SYMBOL_TIMEFRAME.pkl` |
-| **Auto-load** | On startup, if a matching state file exists, training is skipped and the model resumes |
-| **Manual load** | `--load-state states/EURUSD_H1.pkl` forces loading a specific file |
-| **Disable** | `--no-save-state` prevents saving on exit |
-
----
-
-## Backtest Mode
-
-Run a walk-forward simulation on historical MT5 data without placing real orders.
-
-```bash
-# Train on 1000 bars, backtest on next 500 (default split)
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --backtest
-
-# Custom train/test split with spread simulation
-python symplectic_forecaster.py --symbol XAUUSD --timeframe H4 --backtest \
-    --train-bars 2000 --test-bars 1000 --spread-pips 2.0 --initial-balance 50000
-
-# Pure out-of-sample: freeze model weights during test period
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --backtest \
-    --train-bars 1500 --test-bars 500 --freeze-model
-```
-
-### Walk-Forward Optimizer
-
-Grid-search confidence, risk %, and R:R on the same train/test split:
-
-```bash
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --optimize
-
-# Custom search grid
-python symplectic_forecaster.py --symbol EURUSD --timeframe H1 --optimize \
-    --opt-confidence "0.25,0.35,0.45" --opt-risk "0.5,1.0" \
-    --opt-reward-risk "1.5,2.0,3.0"
-```
-
----
-
-## Project Structure
-
-```
-symplectic-forecaster-mt5/
-├── symplectic_forecaster.py   # Main engine + continuous learning + background server
-├── dashboard.html             # Portfolio analysis dashboard (equity, trades, KPIs)
-├── run.bat                    # Windows launcher (auto-selects Python 3.11)
-├── requirements.txt           # Python dependencies
-├── LICENSE                    # MIT License
-└── README.md                  # This file
-```
-
----
-
-## Dependencies
-
-| Package | Required | Purpose |
-|---|---|---|
-| `MetaTrader5` | Yes | Live market data from MT5 terminal |
-| `numpy` | Yes | Numerical computation |
-| `pandas` | Yes | Data manipulation |
-| `scipy` | Yes | Convex hull computation |
-| `scikit-learn` | Yes | ML model (SGDRegressor with L2 regularization) |
-| `matplotlib` | Yes | Backtest equity charts |
-| `ripser` | Optional | Exact persistent homology (TDA) |
-| `river` | Optional | Online ML ensemble (PA + Hoeffding Tree) |
-
----
+Once running, the system will initialize the PyTorch and Causal Optimizer background workers. It will require a "warm-up" period (by default, 80 historical bars) to build the initial phase-space matrix and causal graphs before outputting its first live trade.
 
 ## Disclaimer
 
-> [!WARNING]
-> **This software is for educational and research purposes only.**
->
-> - This is **not** financial advice. Trading involves substantial risk of loss.
-> - Past performance does not guarantee future results.
-> - The mathematical models provide *structured analysis*, not certainty.
-> - Always test on a **demo account** before considering real capital.
-> - The authors assume no liability for financial losses.
-
----
-
-## References
-
-1. Mishra, H. (2026). *Symplectic Phase-Space Geometry for Financial Time Series*. Stability Lemma 1.
-2. Shultz, G. (2023). *Topological Data Analysis for Financial Time Series*. SSRN 4378151.
-3. Mantegna, R. N. (1999). *Hierarchical Structure in Financial Markets*. Eur. Phys. J. B, 11, 193–197.
-4. Cieliebak, K. et al. (2005). *Symplectic Homology and the Eilenberg-Steenrod Axioms*. arXiv:math/0506191.
-
----
-
-## License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This software integrates experimental machine learning techniques. It is strictly for educational and research purposes. Do not deploy this on live capital without extensive forward-testing. Algorithmic high-frequency trading carries substantial financial risk.
