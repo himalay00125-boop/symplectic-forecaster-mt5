@@ -95,9 +95,13 @@ def ai_worker_loop(request_queue: mp.Queue, response_queue: mp.Queue):
                 # Blend sequence prediction and RL policy
                 final_forecast = (forecast + rl_action[0] * 0.01) / 2.0
                 
+                # Calculate synthetic confidence based on forecast magnitude
+                confidence = float(min(0.99, 0.5 + abs(final_forecast) * 10.0))
+                
                 response_queue.put({
                     "id": req["id"],
                     "forecast": float(final_forecast),
+                    "confidence": confidence,
                     "pred_interval_width": 0.005 # Placeholder conformal width
                 })
                 

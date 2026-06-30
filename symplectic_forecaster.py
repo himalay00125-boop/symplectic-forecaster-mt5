@@ -4257,6 +4257,7 @@ class SymplecticForecaster:
                 pred = {
                     "forecast": resp["forecast"],
                     "direction": 1 if resp["forecast"] > 0 else -1,
+                    "confidence": resp.get("confidence", 0.0),
                     "pred_interval_width": resp["pred_interval_width"],
                     "pred_interval_lower": resp["forecast"] - resp["pred_interval_width"]/2,
                     "pred_interval_upper": resp["forecast"] + resp["pred_interval_width"]/2,
