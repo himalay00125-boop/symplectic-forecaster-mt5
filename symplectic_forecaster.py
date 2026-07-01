@@ -4378,9 +4378,6 @@ class SymplecticForecaster:
         rdf = pd.DataFrame(results)
         print(f"[INFO] Pipeline complete. {len(rdf)} forecasts generated.")
         print(f"[INFO] Model updated {self._model._n_updates} times.")
-        if HAS_RIVER:
-            print(f"[INFO] Final MAE (PA):  {self._model._mae_pa.get():.6f}")
-            print(f"[INFO] Final MAE (HT):  {self._model._mae_ht.get():.6f}")
             
         global global_dashboard_state
         if global_dashboard_state:
