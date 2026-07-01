@@ -2056,6 +2056,7 @@ def run_multi_symbol(
                 on_signal=engine.on_signal,
                 on_poll=on_poll,
                 connection=conn,
+                dashboard_state=dashboard_state,
             )
         except Exception as e:
             print(f"[{sym}] ERROR: {e}")
@@ -4508,7 +4509,8 @@ class SymplecticForecaster:
                      poll_interval: float = 0.0,
                      on_signal: Callable = None,
                      on_poll: Callable = None,
-                     connection: MT5Connection = None) -> None:
+                     connection: MT5Connection = None,
+                     dashboard_state = None) -> None:
         """
         Continuous live monitoring loop using MetaTrader 5.
 
@@ -4601,13 +4603,11 @@ class SymplecticForecaster:
 
                 if out:
                     out["regime"] = "ALERT" if out.get("alert", False) else "NORMAL"
-                    
-                    global global_dashboard_state
-                    if global_dashboard_state:
+                    if dashboard_state:
                         pts = np.array(list(self._phase_buf), dtype=float)
                         hull_verts = get_convex_hull_vertices(pts)
                         acc_info = connection.get_account_info() if connection else {}
-                        global_dashboard_state.update_live_metrics(
+                        dashboard_state.update_live_metrics(
                             symbol=symbol,
                             timeframe=timeframe_str,
                             latest_forecast=out,
@@ -4616,7 +4616,21 @@ class SymplecticForecaster:
                             acc_info=acc_info,
                             total_updates=self._model._n_updates
                         )
-                    
+                    else:
+                        global global_dashboard_state
+                        if global_dashboard_state:
+                            pts = np.array(list(self._phase_buf), dtype=float)
+                            hull_verts = get_convex_hull_vertices(pts)
+                            acc_info = connection.get_account_info() if connection else {}
+                            global_dashboard_state.update_live_metrics(
+                                symbol=symbol,
+                                timeframe=timeframe_str,
+                                latest_forecast=out,
+                                phase_buf=list(self._phase_buf),
+                                hull_points=hull_verts.tolist(),
+                                acc_info=acc_info,
+                                total_updates=self._model._n_updates
+                            )
                     if on_signal:
                         on_signal(out, symbol)
                     else:
