@@ -5865,7 +5865,6 @@ Examples:
         print(f"\n[ERROR] {e}")
         sys.exit(1)
 
-    global global_dashboard_state
     global_dashboard_state = None
     if not args.backtest and not args.optimize:
         global_dashboard_state = DashboardState()
