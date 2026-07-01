@@ -17,11 +17,15 @@ import datetime
 import math
 import sys
 import time
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Windows workaround for Ray
+os.environ['RAY_ENABLE_WINDOWS_ORPHAN_SAFE'] = '0'
 
 # ---------------------------------------------------------------------------
 # Import the core engine from the main module
