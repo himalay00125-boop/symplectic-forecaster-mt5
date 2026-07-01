@@ -1,15 +1,31 @@
 import time
 import threading
 import requests
+import sys
+import io
 import os
 import warnings
 import logging
+
+# Suppress ALL HuggingFace noise before any HF import
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 warnings.filterwarnings("ignore", message=".*unauthenticated.*")
-logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
+logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+logging.getLogger("huggingface_hub.utils._validators").setLevel(logging.CRITICAL)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 from transformers import pipeline
+try:
+    from huggingface_hub.utils import disable_progress_bars
+    disable_progress_bars()
+except ImportError:
+    pass
 
 _GLOBAL_FINBERT = None
 
@@ -23,9 +39,18 @@ class FundamentalAgent:
         self.update_interval = update_interval
         global _GLOBAL_FINBERT
         if _GLOBAL_FINBERT is None:
-            print("[NLP] Loading FinBERT model... (this may take a moment on first run)")
+            print("[NLP] Loading FinBERT model...")
             try:
-                _GLOBAL_FINBERT = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+                # Temporarily redirect stderr to suppress any remaining HF warnings
+                _old_stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    _GLOBAL_FINBERT = pipeline(
+                        "sentiment-analysis", model="ProsusAI/finbert"
+                    )
+                finally:
+                    sys.stderr = _old_stderr
+                print("[NLP] FinBERT loaded successfully.")
             except Exception as e:
                 print(f"[NLP ERROR] Could not load FinBERT: {e}")
         self.nlp = _GLOBAL_FINBERT
