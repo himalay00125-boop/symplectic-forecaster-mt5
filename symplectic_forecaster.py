@@ -70,7 +70,19 @@ from datetime import datetime, date
 import importlib
 import os
 os.environ["RAY_ENABLE_WINDOWS_ORPHAN_SAFE"] = "0"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+import logging
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 import ray
+
+# ---- Module-level singleton caches for shared heavy resources ----
+_GLOBAL_RAY_READY = False
+_GLOBAL_MAMBA_MODEL = None
+_GLOBAL_NLP_AGENT = None
+_INIT_LOCK = __import__("threading").Lock()
 import multiprocessing as mp
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -1942,13 +1954,43 @@ def run_multi_symbol(
     All share the same MT5 connection (thread-safe in MT5).
     """
     import concurrent.futures
-    
+
+    # ---- Pre-initialize shared heavy resources ONCE before threads ----
+    shared_nlp = None
+    if HAS_NLP:
+        global _GLOBAL_NLP_AGENT
+        with _INIT_LOCK:
+            if _GLOBAL_NLP_AGENT is None:
+                _GLOBAL_NLP_AGENT = FundamentalAgent()
+        shared_nlp = _GLOBAL_NLP_AGENT
+        shared_nlp.start(symbols)
+
+    # Pre-init Mamba model so threads don't race
+    if HAS_AI_ENGINE:
+        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL
+        with _INIT_LOCK:
+            if not _GLOBAL_RAY_READY and _GLOBAL_MAMBA_MODEL is None:
+                try:
+                    if not ray.is_initialized():
+                        ray.init(ignore_reinit_error=True, logging_level="ERROR")
+                    _GLOBAL_RAY_READY = True
+                except Exception as e:
+                    print(f"[RAY] Ray unavailable on Windows — using local Mamba. ({e})")
+                    _GLOBAL_RAY_READY = False
+                if not _GLOBAL_RAY_READY:
+                    from ai_engine import SymplecticSTGCN_KAN
+                    _GLOBAL_MAMBA_MODEL = SymplecticSTGCN_KAN(
+                        input_dim=16, hidden_dim=64, num_layers=2
+                    )
+                    print("[AI ENGINE] Loaded local Mamba model (shared).")
+
     def run_symbol(sym: str):
         """Worker function for one symbol."""
         try:
             conn.ensure_symbol(sym)
             fc = SymplecticForecaster(
-                window=args.window, alert_pct=0.95, min_train_bars=80
+                window=args.window, alert_pct=0.95, min_train_bars=80,
+                shared_nlp_agent=shared_nlp,
             )
             
             tf_mt5 = TIMEFRAME_MAP[tf_str]
@@ -4087,7 +4129,10 @@ class SymplecticForecaster:
                  window:         int   = 60,
                  alert_pct:      float = 0.95,
                  tda_subsample:  int   = 100,
-                 min_train_bars: int   = 80):
+                 min_train_bars: int   = 80,
+                 shared_nlp_agent=None):
+
+        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL, _GLOBAL_NLP_AGENT
 
         self.window          = window
         self.alert_pct       = alert_pct
@@ -4101,44 +4146,48 @@ class SymplecticForecaster:
         self._model          = BatchedLearner(RegimeAwareModel(), batch_size=32)
         self._scenario_gen   = ScenarioGenerator(self._model)
 
-        # Ray Distributed Architecture for AI Engine
+        # Ray Distributed Architecture for AI Engine (singleton init)
         self.ai_actor = None
         if HAS_AI_ENGINE:
-            import os
-            os.environ['RAY_ENABLE_WINDOWS_ORPHAN_SAFE'] = '0'
-            try:
-                if not ray.is_initialized():
-                    ray.init(ignore_reinit_error=True, logging_level="ERROR")
-                self.ai_actor = AIEngineActor.remote()
-            except Exception as e:
-                print(f"[RAY ERROR] Failed to initialize Ray: {e}")
-                print("[AI ENGINE] Falling back to synchronous local Mamba execution.")
-                
-                class MockRemoteMethod:
-                    def __init__(self, func):
-                        self.func = func
-                    def remote(self, *args, **kwargs):
-                        # Mimic ray.get() which we assume is handled in symplectic_forecaster if needed.
-                        # Wait, symplectic_forecaster doesn't call ray.get(), it just uses actor.method.remote()
-                        return self.func(*args, **kwargs)
-                
-                class MockAIEngineActor:
-                    def __init__(self):
-                        # Instantiate the underlying class by bypassing ray wrapper
-                        # Ray wrappers have ._Class or we can just import the original class if it wasn't decorated
-                        pass
-                
-                # To make this simpler, let's just use the underlying PyTorch model directly!
-                from ai_engine import SymplecticSTGCN_KAN
-                import torch
-                self._fallback_mamba = SymplecticSTGCN_KAN(input_dim=16, hidden_dim=64, num_layers=2)
+            with _INIT_LOCK:
+                if not _GLOBAL_RAY_READY:
+                    try:
+                        if not ray.is_initialized():
+                            ray.init(ignore_reinit_error=True, logging_level="ERROR")
+                        _GLOBAL_RAY_READY = True
+                    except Exception as e:
+                        print(f"[RAY] Ray unavailable on Windows — using local Mamba. ({e})")
+                        _GLOBAL_RAY_READY = False
+
+            if _GLOBAL_RAY_READY:
+                try:
+                    self.ai_actor = AIEngineActor.remote()
+                except Exception:
+                    _GLOBAL_RAY_READY = False
+
+            if not _GLOBAL_RAY_READY:
+                # Reuse a single fallback Mamba model across all symbols
+                with _INIT_LOCK:
+                    if _GLOBAL_MAMBA_MODEL is None:
+                        from ai_engine import SymplecticSTGCN_KAN
+                        _GLOBAL_MAMBA_MODEL = SymplecticSTGCN_KAN(
+                            input_dim=16, hidden_dim=64, num_layers=2
+                        )
+                        print("[AI ENGINE] Loaded local Mamba model (shared).")
+                self._fallback_mamba = _GLOBAL_MAMBA_MODEL
                 self.ai_actor = "LOCAL_MAMBA_FALLBACK"
-            
-        self.nlp_agent = None
-        if HAS_NLP:
-            self.nlp_agent = FundamentalAgent()
-            self.nlp_agent.start(["EURUSD", "GBPUSD"]) # We can pass actual symbol in run_multi_symbol
-            
+        # NLP Agent — reuse shared instance if provided
+        if shared_nlp_agent is not None:
+            self.nlp_agent = shared_nlp_agent
+        else:
+            self.nlp_agent = None
+            if HAS_NLP:
+                with _INIT_LOCK:
+                    if _GLOBAL_NLP_AGENT is None:
+                        _GLOBAL_NLP_AGENT = FundamentalAgent()
+                self.nlp_agent = _GLOBAL_NLP_AGENT
+
+
         self.causal_adj_matrix = None
 
         self._bar_count      = 0

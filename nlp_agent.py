@@ -2,7 +2,13 @@ import time
 import threading
 import requests
 import os
+import warnings
+import logging
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 from transformers import pipeline
 
 _GLOBAL_FINBERT = None
