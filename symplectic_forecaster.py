@@ -68,6 +68,8 @@ import argparse
 import pickle
 from datetime import datetime, date
 import importlib
+import os
+os.environ["RAY_ENABLE_WINDOWS_ORPHAN_SAFE"] = "0"
 import ray
 import multiprocessing as mp
 from dataclasses import dataclass, field, asdict

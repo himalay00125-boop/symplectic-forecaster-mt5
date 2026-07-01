@@ -1,7 +1,11 @@
 import time
 import threading
 import requests
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 from transformers import pipeline
+
+_GLOBAL_FINBERT = None
 
 class FundamentalAgent:
     """
@@ -11,13 +15,14 @@ class FundamentalAgent:
     """
     def __init__(self, update_interval: float = 60.0 * 15):
         self.update_interval = update_interval
-        # Use ProsusAI's finbert, fine-tuned on financial text
-        print("[NLP] Loading FinBERT model... (this may take a moment on first run)")
-        try:
-            self.nlp = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-        except Exception as e:
-            print(f"[NLP ERROR] Could not load FinBERT: {e}")
-            self.nlp = None
+        global _GLOBAL_FINBERT
+        if _GLOBAL_FINBERT is None:
+            print("[NLP] Loading FinBERT model... (this may take a moment on first run)")
+            try:
+                _GLOBAL_FINBERT = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+            except Exception as e:
+                print(f"[NLP ERROR] Could not load FinBERT: {e}")
+        self.nlp = _GLOBAL_FINBERT
 
         self._sentiment_cache = {}
         self._last_update = {}
