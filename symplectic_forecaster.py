@@ -424,7 +424,7 @@ class TradingEngine:
 
         # Format timestamp
         if isinstance(ts, (int, float)):
-            ts_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         else:
             ts_str = str(ts)
 
@@ -1240,8 +1240,8 @@ class MT5TradeExecutor:
         newly_closed = []
         
         # Get all deals for our magic number in the last check period
-        from_date = datetime.datetime.fromtimestamp(self._last_deals_check - 30)
-        to_date = datetime.datetime.fromtimestamp(now + 10)
+        from_date = datetime.fromtimestamp(self._last_deals_check - 30)
+        to_date = datetime.fromtimestamp(now + 10)
         deals = mt5.history_deals_get(from_date, to_date, group=f"*,magic={self.config.magic_number}")
         
         if deals is None:
@@ -2077,7 +2077,7 @@ class DashboardState:
             
             ts = latest_forecast.get("timestamp", time.time())
             if isinstance(ts, (int, float)):
-                dt_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+                dt_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
             else:
                 dt_str = str(ts)
             
@@ -4595,7 +4595,7 @@ class SymplecticForecaster:
                         on_signal(out, symbol)
                     else:
                         # Default: simple one-line print
-                        dt_str = datetime.datetime.fromtimestamp(bar_time).strftime(
+                        dt_str = datetime.fromtimestamp(bar_time).strftime(
                             "%Y-%m-%d %H:%M"
                         )
                         d_arrow = ("▲" if out.get("direction", 0) > 0
@@ -4610,7 +4610,7 @@ class SymplecticForecaster:
                         )
                 else:
                     # Still in warm-up
-                    dt_str = datetime.datetime.fromtimestamp(bar_time).strftime(
+                    dt_str = datetime.fromtimestamp(bar_time).strftime(
                         "%Y-%m-%d %H:%M"
                     )
                     print(f"  [{dt_str}] warming up... "
@@ -4697,7 +4697,7 @@ class SymplecticForecaster:
             "version": self.STATE_VERSION,
             "symbol": symbol.upper(),
             "timeframe": timeframe.upper(),
-            "saved_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "saved_at": datetime.utcnow().isoformat() + "Z",
             "config": {
                 "window": self.window,
                 "alert_pct": self.alert_pct,
@@ -5460,7 +5460,7 @@ def save_equity_chart(
     if not result.equity_curve:
         return False
 
-    times = [datetime.datetime.fromtimestamp(t) for t, _ in result.equity_curve]
+    times = [datetime.fromtimestamp(t) for t, _ in result.equity_curve]
     equities = [e for _, e in result.equity_curve]
 
     fig, (ax_eq, ax_dd) = plt.subplots(
@@ -5733,8 +5733,8 @@ def run_backtest_cli(
                 "exit_price": t.exit_price,
                 "volume": t.volume,
                 "pnl": t.pnl,
-                "entry_time": datetime.datetime.fromtimestamp(t.entry_time),
-                "exit_time": datetime.datetime.fromtimestamp(t.exit_time),
+                "entry_time": datetime.fromtimestamp(t.entry_time),
+                "exit_time": datetime.fromtimestamp(t.exit_time),
                 "exit_reason": t.exit_reason,
             })
         pd.DataFrame(rows).to_csv(export_path, index=False)
