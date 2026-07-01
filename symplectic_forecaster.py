@@ -74,12 +74,16 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 import logging
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub.utils._validators").setLevel(logging.ERROR)
 import ray
 
 # ---- Module-level singleton caches for shared heavy resources ----
 _GLOBAL_RAY_READY = False
+_RAY_INIT_ATTEMPTED = False  # True once we've tried (success or fail)
 _GLOBAL_MAMBA_MODEL = None
 _GLOBAL_NLP_AGENT = None
 _INIT_LOCK = __import__("threading").Lock()
@@ -1967,22 +1971,23 @@ def run_multi_symbol(
 
     # Pre-init Mamba model so threads don't race
     if HAS_AI_ENGINE:
-        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL
+        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL, _RAY_INIT_ATTEMPTED
         with _INIT_LOCK:
-            if not _GLOBAL_RAY_READY and _GLOBAL_MAMBA_MODEL is None:
+            if not _RAY_INIT_ATTEMPTED:
+                _RAY_INIT_ATTEMPTED = True
                 try:
                     if not ray.is_initialized():
                         ray.init(ignore_reinit_error=True, logging_level="ERROR")
                     _GLOBAL_RAY_READY = True
-                except Exception as e:
-                    print(f"[RAY] Ray unavailable on Windows — using local Mamba. ({e})")
+                except Exception:
+                    print(f"[RAY] Ray unavailable on Windows — using local Mamba.")
                     _GLOBAL_RAY_READY = False
-                if not _GLOBAL_RAY_READY:
-                    from ai_engine import SymplecticSTGCN_KAN
-                    _GLOBAL_MAMBA_MODEL = SymplecticSTGCN_KAN(
-                        input_dim=16, hidden_dim=64, num_layers=2
-                    )
-                    print("[AI ENGINE] Loaded local Mamba model (shared).")
+            if not _GLOBAL_RAY_READY and _GLOBAL_MAMBA_MODEL is None:
+                from ai_engine import SymplecticSTGCN_KAN
+                _GLOBAL_MAMBA_MODEL = SymplecticSTGCN_KAN(
+                    input_dim=16, hidden_dim=64, num_layers=2
+                )
+                print("[AI ENGINE] Loaded local Mamba model (shared).")
 
     def run_symbol(sym: str):
         """Worker function for one symbol."""
@@ -3410,38 +3415,6 @@ class RegimeAwareModel:
             except Exception:
                 pass
 
-    def predict_one(self, feats: Dict[str, float]) -> Dict[str, float]:
-        """Route prediction to the appropriate regime-specific model."""
-        regime = self._determine_regime(feats)
-        
-        # Use distilled model if available and enough updates
-        if hasattr(self, '_distilled_model') and self._distilled_model and self._n_updates > 5000:
-            try:
-                fast_pred = self._distilled_model.predict_one(feats)
-                result = {
-                    "forecast": fast_pred,
-                    "direction": int(np.sign(fast_pred)) if abs(fast_pred) > 1e-6 else 0,
-                    "regime_used": regime,
-                    "distilled": True
-                }
-            except Exception:
-                # Fall back to regime model
-                result = self.models[regime].predict_one(feats)
-                result["regime_used"] = regime
-                result["distilled"] = False
-        else:
-            result = self.models[regime].predict_one(feats)
-            result["regime_used"] = regime
-            result["distilled"] = False
-        
-        # Add conformal prediction interval
-        point_pred = result.get("forecast", 0.0)
-        lower, upper = self.conformal_predictor.get_interval(point_pred)
-        result["pred_interval_lower"] = lower
-        result["pred_interval_upper"] = upper
-        result["pred_interval_width"] = upper - lower
-        
-        return result
 class HyperparameterBandit:
     """
     Lightweight Multi-Armed Bandit for Online Hyperparameter Optimization.
@@ -4132,7 +4105,7 @@ class SymplecticForecaster:
                  min_train_bars: int   = 80,
                  shared_nlp_agent=None):
 
-        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL, _GLOBAL_NLP_AGENT
+        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL, _GLOBAL_NLP_AGENT, _RAY_INIT_ATTEMPTED
 
         self.window          = window
         self.alert_pct       = alert_pct
@@ -4150,22 +4123,23 @@ class SymplecticForecaster:
         self.ai_actor = None
         if HAS_AI_ENGINE:
             with _INIT_LOCK:
-                if not _GLOBAL_RAY_READY:
+                if not _RAY_INIT_ATTEMPTED:
+                    _RAY_INIT_ATTEMPTED = True
                     try:
                         if not ray.is_initialized():
                             ray.init(ignore_reinit_error=True, logging_level="ERROR")
                         _GLOBAL_RAY_READY = True
-                    except Exception as e:
-                        print(f"[RAY] Ray unavailable on Windows — using local Mamba. ({e})")
+                    except Exception:
                         _GLOBAL_RAY_READY = False
+                        print("[RAY] Ray unavailable on Windows — using local Mamba.")
 
             if _GLOBAL_RAY_READY:
                 try:
                     self.ai_actor = AIEngineActor.remote()
                 except Exception:
-                    _GLOBAL_RAY_READY = False
+                    pass
 
-            if not _GLOBAL_RAY_READY:
+            if self.ai_actor is None:
                 # Reuse a single fallback Mamba model across all symbols
                 with _INIT_LOCK:
                     if _GLOBAL_MAMBA_MODEL is None:
@@ -4176,6 +4150,7 @@ class SymplecticForecaster:
                         print("[AI ENGINE] Loaded local Mamba model (shared).")
                 self._fallback_mamba = _GLOBAL_MAMBA_MODEL
                 self.ai_actor = "LOCAL_MAMBA_FALLBACK"
+
         # NLP Agent — reuse shared instance if provided
         if shared_nlp_agent is not None:
             self.nlp_agent = shared_nlp_agent
