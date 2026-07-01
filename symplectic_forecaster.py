@@ -66,7 +66,7 @@ import random
 import collections
 import argparse
 import pickle
-from datetime import datetime
+from datetime import datetime, date
 import importlib
 import ray
 import multiprocessing as mp
@@ -573,7 +573,7 @@ class RiskManager:
     def __init__(self, config: RiskConfig):
         self.config = config
         self._session_start_equity: Optional[float] = None
-        self._session_date: Optional[datetime.date] = None
+        self._session_date: Optional[date] = None
         self._trading_halted = False
         self._halt_reason = ""
 
@@ -582,12 +582,12 @@ class RiskManager:
         acc = mt5.account_info()
         if acc:
             self._session_start_equity = acc.equity
-            self._session_date = datetime.date.today()
+            self._session_date = date.today()
             self._trading_halted = False
             self._halt_reason = ""
 
     def _roll_session_if_new_day(self):
-        today = datetime.date.today()
+        today = date.today()
         if self._session_date != today:
             self.reset_session()
 
