@@ -2422,6 +2422,7 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
         if parsed_url.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
             try:
                 with open(self.dashboard_html_path, "r", encoding="utf-8") as f:
@@ -2435,6 +2436,9 @@ class DashboardHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.end_headers()
             data_dict = self.state.to_json_dict(target_symbol=target_symbol)
             self.wfile.write(json.dumps(data_dict).encode("utf-8"))
@@ -5878,10 +5882,11 @@ Examples:
             )
             if args.news_filter:
                 engine._news_filter_enabled = True
-            if global_dashboard_state:
-                global_dashboard_state.engine = engine
         else:
             engine = TradingEngine(confidence_threshold=args.confidence)
+            
+        if global_dashboard_state:
+            global_dashboard_state.engine = engine
 
         risk_cfg = RiskConfig(
             risk_per_trade_pct=args.risk_pct,

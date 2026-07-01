@@ -207,8 +207,9 @@ function valClass(v) { const n = parseFloat(v); return n > 0 ? 'pos' : (n < 0 ? 
 window.activeSymbol = window.activeSymbol || '';
 
 function updateDashboard() {
-  const url = window.activeSymbol ? `/data?symbol=${window.activeSymbol}` : '/data';
-  fetch(url).then(r => r.json()).then(data => {
+  const t = Date.now();
+  const url = window.activeSymbol ? `/data?symbol=${window.activeSymbol}&_t=${t}` : `/data?_t=${t}`;
+  fetch(url, { cache: 'no-store' }).then(r => r.json()).then(data => {
     const m = data.meta || {};
     const p = data.PORTFOLIO || {};
     
