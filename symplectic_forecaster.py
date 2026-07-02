@@ -4303,9 +4303,19 @@ class SymplecticForecaster:
                     elif feats_t.shape[-1] > 16:
                         feats_t = feats_t[:, :, :, :16]
                     adj_t = torch.eye(1).unsqueeze(0)
-                    with torch.no_grad():
-                        _ = self._fallback_mamba(feats_t, adj_t) # dummy forward pass to simulate mamba execution
+                    if not hasattr(self, "_fallback_optim"):
+                        import torch.optim as optim
+                        import torch.nn as nn
+                        self._fallback_optim = optim.Adam(self._fallback_mamba.parameters(), lr=0.001)
+                        self._fallback_loss = nn.MSELoss()
+
+                    self._fallback_optim.zero_grad()
+                    out = self._fallback_mamba(feats_t, adj_t)
                     weighted_target = 0.5 * rets[0] + 0.3 * rets[1] + 0.2 * rets[2]
+                    target_t = torch.tensor([[weighted_target]], dtype=torch.float32)
+                    loss = self._fallback_loss(out, target_t)
+                    loss.backward()
+                    self._fallback_optim.step()
                 elif self.ai_actor:
                     # Ray actor trains online during inference via continuous learning
                     pass
