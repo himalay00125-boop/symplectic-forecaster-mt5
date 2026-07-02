@@ -909,6 +909,10 @@ class MT5TradeExecutor:
                 if analytics is not None:
                     rr_ratio = analytics.suggest_rr_adjustment(rr_ratio, vol_ratio)
 
+        # ── Cap RR Ratio ──
+        # Ensure we never risk more than our reward (TP must be >= SL)
+        rr_ratio = max(1.0, rr_ratio)
+
         if self.config.use_stability_bands and forecast:
             lower = forecast.get("lower_band") or []
             upper = forecast.get("upper_band") or []
