@@ -432,7 +432,7 @@ class TradingEngine:
         """
         direction  = forecast.get("direction", 0)
         confidence = forecast.get("confidence", 0.0)
-        pred_ret   = forecast.get("predicted_return", 0.0)
+        pred_ret   = forecast.get("predicted_return", forecast.get("forecast", 0.0))
         regime     = forecast.get("regime",
                                   "ALERT" if forecast.get("alert", False) else "NORMAL")
         price      = forecast.get("close", forecast.get("current_price", 0.0))
@@ -1076,7 +1076,7 @@ class MT5TradeExecutor:
             sl=sl,
             tp=tp,
             entry_confidence=forecast.get("confidence", 0.0),
-            entry_predicted_return=forecast.get("predicted_return", 0.0),
+            entry_predicted_return=forecast.get("predicted_return", forecast.get("forecast", 0.0)),
             entry_regime="ALERT" if forecast.get("alert", False) else "NORMAL",
             entry_capacity=forecast.get("capacity", 0.0),
             entry_perimeter=forecast.get("perimeter", 0.0),
@@ -4644,7 +4644,7 @@ class SymplecticForecaster:
                         print(
                             f"  [{dt_str}] {symbol} "
                             f"Close={bar.close:.5f} "
-                            f"Ret={out.get('predicted_return', 0):+.4%} "
+                            f"Ret={out.get('predicted_return', out.get('forecast', 0)):+.4%} "
                             f"{d_arrow} "
                             f"Conf={out.get('confidence', 0):.1%}"
                         )
