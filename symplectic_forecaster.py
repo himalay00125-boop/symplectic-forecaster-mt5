@@ -931,9 +931,13 @@ class MT5TradeExecutor:
 
         # ── Hard ATR Cap ──
         atr = self.risk.compute_atr(symbol, timeframe, self.config.atr_period)
-        max_dist = atr * getattr(self.config, 'max_atr_sl_multiplier', 3.5)
-        if sl_dist > max_dist:
-            sl_dist = max_dist
+        if atr > 0:
+            max_dist = atr * getattr(self.config, 'max_atr_sl_multiplier', 3.5)
+            if sl_dist > max_dist:
+                sl_dist = max_dist
+
+        # Guarantee minimum stop distance to prevent MT5 invalid stops
+        sl_dist = max(sl_dist, min_dist)
 
         if direction == "BUY":
             sl = self._normalize_price(symbol, entry_price - sl_dist)
@@ -1370,13 +1374,18 @@ class MT5TradeExecutor:
             for pos in self.get_positions(symbol):
                 is_buy = (pos.type == mt5.POSITION_TYPE_BUY)
                 current_price = tick.bid if is_buy else tick.ask
+                min_dist = self._min_stop_distance(symbol)
                 if is_buy and pos.tp > current_price:
                     # Cut remaining distance to TP in half
                     new_tp = current_price + (pos.tp - current_price) * 0.5
+                    # Never drag TP below breakeven
+                    new_tp = max(new_tp, pos.price_open + min_dist)
                     if new_tp < pos.tp:
                         self.modify_tp(pos, new_tp)
                 elif not is_buy and pos.tp > 0 and pos.tp < current_price:
                     new_tp = current_price - (current_price - pos.tp) * 0.5
+                    # Never drag TP above breakeven
+                    new_tp = min(new_tp, pos.price_open - min_dist)
                     if new_tp > pos.tp:
                         self.modify_tp(pos, new_tp)
 
