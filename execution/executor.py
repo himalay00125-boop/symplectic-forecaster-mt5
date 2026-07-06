@@ -1087,7 +1087,7 @@ class AutoTradingEngine(TradingEngine):
         
         # Always manage trailing stops on open positions
         self.executor.manage_trailing_stops(symbol, self.timeframe)
-        self.executor.manage_dynamic_targets(symbol, forecast)
+        # Removed dynamic target management to keep trades simple
 
         # News blackout filter
         if getattr(self, '_news_filter_enabled', False):

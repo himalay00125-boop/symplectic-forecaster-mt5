@@ -99,50 +99,20 @@ except ImportError:
     HAS_AI_ENGINE = False
     
 try:
-    from nlp_agent import FundamentalAgent
-    HAS_NLP = True
-except ImportError:
-    HAS_NLP = False
-    
-try:
-    from causal_discovery import learn_causal_graph
-    HAS_CAUSAL = True
-except ImportError:
-    HAS_CAUSAL = False
-
-# Import microservice workers
-try:
-    from ai_engine import ai_worker_loop
-    from causal_optimizer import causal_optimizer_loop
-except ImportError:
-    pass
-
-import numpy as np
-import pandas as pd
-from scipy.spatial import ConvexHull
-
-warnings.filterwarnings("ignore")
-
-# Thread-safe global reference to dashboard state
-global_dashboard_state = None
-
-# ---------------------------------------------------------------------------
-# Optional heavy dependencies — graceful fallback if unavailable
-# ---------------------------------------------------------------------------
-try:
-    import ripser
-    HAS_RIPSER = True
-except ImportError:
-    HAS_RIPSER = False
-    print("[WARN] ripser not found — TDA features will be approximated.")
-
-try:
     from river import linear_model, preprocessing, tree, metrics, optim, ensemble
     HAS_RIVER = True
 except ImportError:
     HAS_RIVER = False
     print("[WARN] river not found — falling back to sklearn PARegressor.")
     from sklearn.linear_model import SGDRegressor
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# Thread-safe global reference to dashboard state
+global_dashboard_state = None
 
 try:
     import MetaTrader5 as mt5
@@ -263,33 +233,15 @@ def run_multi_symbol(
 
     # ---- Pre-initialize shared heavy resources ONCE before threads ----
     shared_nlp = None
-    if HAS_NLP:
+    try:
+        from nlp_agent import FundamentalAgent
         global _GLOBAL_NLP_AGENT
-        with _INIT_LOCK:
-            if _GLOBAL_NLP_AGENT is None:
-                _GLOBAL_NLP_AGENT = FundamentalAgent()
+        if _GLOBAL_NLP_AGENT is None:
+            _GLOBAL_NLP_AGENT = FundamentalAgent()
         shared_nlp = _GLOBAL_NLP_AGENT
         shared_nlp.start(symbols)
-
-    # Pre-init Mamba model so threads don't race
-    if HAS_AI_ENGINE:
-        global _GLOBAL_RAY_READY, _GLOBAL_MAMBA_MODEL, _RAY_INIT_ATTEMPTED
-        with _INIT_LOCK:
-            if not _RAY_INIT_ATTEMPTED:
-                _RAY_INIT_ATTEMPTED = True
-                try:
-                    if not ray.is_initialized():
-                        ray.init(ignore_reinit_error=True, logging_level="ERROR")
-                    _GLOBAL_RAY_READY = True
-                except Exception:
-                    print(f"[RAY] Ray unavailable on Windows — using local Mamba.")
-                    _GLOBAL_RAY_READY = False
-            if not _GLOBAL_RAY_READY and _GLOBAL_MAMBA_MODEL is None:
-                from ai_engine import SymplecticSTGCN_KAN
-                _GLOBAL_MAMBA_MODEL = SymplecticSTGCN_KAN(
-                    input_dim=16, hidden_dim=64, num_layers=2
-                )
-                print("[AI ENGINE] Loaded local Mamba model (shared).")
+    except ImportError:
+        pass
 
     def run_symbol(sym: str):
         """Worker function for one symbol."""

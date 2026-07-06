@@ -206,6 +206,5 @@ class RiskConfig:
     max_positions: int = 2
     magic_number: int = 20260611
     min_stop_pips: float = 10.0
-    use_stability_bands: bool = True
+    use_stability_bands: bool = False
     allow_live: bool = False
-
