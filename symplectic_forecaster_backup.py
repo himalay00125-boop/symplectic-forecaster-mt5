@@ -1377,7 +1377,7 @@ class MT5TradeExecutor:
         return trade
 
     def manage_dynamic_targets(self, symbol: str, forecast: Dict):
-        """Bring TP closer and tighten SL if predictive confidence drops significantly."""
+        """Bring TP closer if predictive confidence drops significantly."""
         conf = forecast.get("confidence", 0.0) if forecast else 0.0
         if conf < 0.65:
             tick = mt5.symbol_info_tick(symbol)
@@ -1386,35 +1386,17 @@ class MT5TradeExecutor:
                 is_buy = (pos.type == mt5.POSITION_TYPE_BUY)
                 current_price = tick.bid if is_buy else tick.ask
                 min_dist = self._min_stop_distance(symbol)
-                
                 if is_buy and pos.tp > current_price:
                     # Cut remaining distance to TP in half
                     new_tp = current_price + (pos.tp - current_price) * 0.5
                     # Never drag TP below breakeven
                     new_tp = max(new_tp, pos.price_open + min_dist)
-                    
-                    # Symmetrically tighten SL to preserve Risk/Reward
-                    if pos.sl > 0 and pos.sl < current_price:
-                        new_sl = current_price - (current_price - pos.sl) * 0.5
-                        new_sl = max(new_sl, pos.sl) # Only trail up
-                        if new_sl > pos.sl + min_dist:
-                            self.modify_sl(pos, new_sl)
-                            
                     if new_tp < pos.tp:
                         self.modify_tp(pos, new_tp)
-                        
                 elif not is_buy and pos.tp > 0 and pos.tp < current_price:
                     new_tp = current_price - (current_price - pos.tp) * 0.5
                     # Never drag TP above breakeven
                     new_tp = min(new_tp, pos.price_open - min_dist)
-                    
-                    # Symmetrically tighten SL to preserve Risk/Reward
-                    if pos.sl > 0 and pos.sl > current_price:
-                        new_sl = current_price + (pos.sl - current_price) * 0.5
-                        new_sl = min(new_sl, pos.sl) # Only trail down
-                        if new_sl < pos.sl - min_dist:
-                            self.modify_sl(pos, new_sl)
-                            
                     if new_tp > pos.tp:
                         self.modify_tp(pos, new_tp)
 
