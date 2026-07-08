@@ -151,7 +151,14 @@ class SymplecticForecaster:
                 time.sleep(5)
         
     def forecast(self, horizon: int = 5) -> Dict:
-        return {"forecast": 0.0}
+        current_price = 0.0
+        if len(self._bar_buf) > 0:
+            current_price = self._bar_buf[-1].close
+        return {
+            "forecast": 0.0,
+            "current_price": current_price,
+            "regime": "NORMAL"
+        }
 
     @staticmethod
     def default_state_path(symbol: str, timeframe: str, base_dir: str = "states") -> Path:
