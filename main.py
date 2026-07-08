@@ -631,8 +631,7 @@ Examples:
             if not state_loaded:
                 print()
                 rdf = fc.train_on_mt5(symbol, tf_str, args.bars, connection=conn)
-                export_path = f"symplectic_{symbol}_{tf_str}.csv"
-                fc.export_results(rdf, export_path)
+                pass
             else:
                 print(f"[INFO] Resuming from saved state — skipping historical training.")
 
