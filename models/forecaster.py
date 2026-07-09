@@ -121,6 +121,7 @@ class SymplecticForecaster:
                      executor=None, connection=None):
         """Poll MT5 for new bars and generate forecasts."""
         print(f"[{symbol}] Live monitoring started...")
+        print(f"[{symbol}] Waiting for the current {timeframe} candle to close before generating the next signal...")
         tf_mt5 = TIMEFRAME_MAP.get(timeframe)
         if poll_interval <= 0:
             poll_interval = 5.0 # default 5 seconds

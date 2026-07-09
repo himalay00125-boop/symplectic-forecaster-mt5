@@ -628,12 +628,10 @@ Examples:
                     symbol, tf_str, args.state_dir))
                 fc.save_state(save_path, symbol, tf_str, executor=executor if 'executor' in locals() else None)
         else:
-            if not state_loaded:
-                print()
-                rdf = fc.train_on_mt5(symbol, tf_str, args.bars, connection=conn)
-                pass
-            else:
-                print(f"[INFO] Resuming from saved state — skipping historical training.")
+            print()
+            fc.train_on_mt5(symbol, tf_str, args.bars, connection=conn)
+            if state_loaded:
+                print(f"[INFO] State loaded, but historical data was fetched to prime the moving average buffers.")
 
             # ── Step 6: Print initial forecast / signal ──
             result = fc.forecast(horizon=5)
