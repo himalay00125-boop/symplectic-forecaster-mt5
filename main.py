@@ -640,24 +640,22 @@ Examples:
             if "error" not in result:
                 initial_forecast = {
                     **result,
-                    "close": result["current_price"],
-                    "alert": result["regime"] == "ALERT",
-                    "capacity": result["current_capacity"],
-                    "betti_1": result["current_betti_1"],
+                    "close": result.get("current_price", 0.0),
+                    "alert": result.get("regime", "NORMAL") == "ALERT",
+                    "capacity": 0.0,
+                    "betti_1": 0,
                 }
 
                 if global_dashboard_state:
-                    pts = np.array(list(fc._phase_buf), dtype=float)
-                    hull_verts = get_convex_hull_vertices(pts)
                     acc_info = conn.get_account_info() if conn else {}
                     global_dashboard_state.update_live_metrics(
                         symbol=symbol,
                         timeframe=tf_str,
                         latest_forecast=initial_forecast,
-                        phase_buf=list(fc._phase_buf),
-                        hull_points=hull_verts.tolist(),
+                        phase_buf=[],
+                        hull_points=[],
                         acc_info=acc_info,
-                        total_updates=fc._model._n_updates
+                        total_updates=getattr(fc._model, '_n_updates', 0)
                     )
 
                 engine.on_signal(initial_forecast, symbol)
