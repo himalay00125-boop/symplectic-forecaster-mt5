@@ -117,7 +117,8 @@ class SymplecticForecaster:
         print(f"[{symbol}] Training complete. Updates: {self._model.get_metrics()['updates']}")
 
     def run_live_mt5(self, symbol: str, timeframe: str, dashboard_state=None,
-                     on_signal=None, on_poll=None, poll_interval: float = 0.0, executor=None):
+                     on_signal=None, on_poll=None, poll_interval: float = 0.0, 
+                     executor=None, connection=None):
         """Poll MT5 for new bars and generate forecasts."""
         print(f"[{symbol}] Live monitoring started...")
         tf_mt5 = TIMEFRAME_MAP.get(timeframe)
